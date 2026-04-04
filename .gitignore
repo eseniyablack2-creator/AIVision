@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build
+frontend/dist/
+*.local
+
+# Logs and caches
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# OS
+$RECYCLE.BIN/
