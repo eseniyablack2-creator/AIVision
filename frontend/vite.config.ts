@@ -1,6 +1,6 @@
+import path from 'node:path'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import path from 'node:path'
 
 function glslAsText() {
   return {
@@ -15,15 +15,41 @@ function glslAsText() {
   }
 }
 
-// https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), glslAsText()],
   resolve: {
-    alias: {
-      globalthis: path.resolve(__dirname, 'src/shims/globalthis.ts'),
-    },
+    alias: [
+      { find: 'globalthis', replacement: path.resolve(__dirname, 'src/shims/globalthis.ts') },
+      {
+        find: 'fast-deep-equal/index.js',
+        replacement: path.resolve(__dirname, 'src/shims/fast-deep-equal.ts'),
+      },
+      {
+        find: 'fast-deep-equal',
+        replacement: path.resolve(__dirname, 'src/shims/fast-deep-equal.ts'),
+      },
+      {
+        find: 'seedrandom/index.js',
+        replacement: path.resolve(__dirname, 'src/shims/seedrandom.ts'),
+      },
+      {
+        find: 'seedrandom',
+        replacement: path.resolve(__dirname, 'src/shims/seedrandom.ts'),
+      },
+      {
+        find: 'spark-md5/spark-md5.js',
+        replacement: path.resolve(__dirname, 'src/shims/spark-md5.ts'),
+      },
+      {
+        find: 'spark-md5',
+        replacement: path.resolve(__dirname, 'src/shims/spark-md5.ts'),
+      },
+    ],
   },
   optimizeDeps: {
-    exclude: ['vtk.js', 'globalthis'],
+    exclude: ['vtk.js'],
+  },
+  worker: {
+    format: 'es',
   },
 })

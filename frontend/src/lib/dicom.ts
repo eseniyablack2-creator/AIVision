@@ -12,6 +12,14 @@ export type ParsedDicomFile = {
   instanceNumber: number
   imagePositionZ: number | null
   patientName: string
+  /** (0010,0020) */
+  patientId: string
+  rows: number
+  columns: number
+  pixelSpacingX: number
+  pixelSpacingY: number
+  sliceThicknessMm: number | null
+  spacingBetweenSlicesMm: number | null
 }
 
 export type DicomSeries = {
@@ -21,6 +29,7 @@ export type DicomSeries = {
   modality: string
   studyDate: string
   patientName: string
+  patientId: string
   files: ParsedDicomFile[]
 }
 
@@ -46,6 +55,23 @@ function readImagePositionZ(dataSet: dicomParser.DataSet) {
 
   const parsed = Number.parseFloat(raw.split('\\')[2] ?? '')
   return Number.isFinite(parsed) ? parsed : null
+}
+
+function parseDecimalTag(dataSet: dicomParser.DataSet, tag: string): number | null {
+  const raw = dataSet.string(tag)
+  if (!raw) return null
+  const first = raw.split('\\')[0]?.trim() ?? ''
+  const parsed = Number.parseFloat(first)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function readPixelSpacingMm(dataSet: dicomParser.DataSet): { x: number; y: number } {
+  const raw = dataSet.string('x00280030')?.split('\\') ?? []
+  const row = Number.parseFloat(raw[0] || '0')
+  const col = Number.parseFloat(raw[1] || '0')
+  const y = Number.isFinite(row) && row > 0 ? row : 1
+  const x = Number.isFinite(col) && col > 0 ? col : 1
+  return { x, y }
 }
 
 export function formatFileSize(size: number) {
@@ -114,6 +140,12 @@ export async function parseDicomFile(
     const byteArray = new Uint8Array(arrayBuffer)
     const dataSet = dicomParser.parseDicom(byteArray)
 
+    const rows = dataSet.uint16('x00280010') ?? 0
+    const columns = dataSet.uint16('x00280011') ?? 0
+    const ps = readPixelSpacingMm(dataSet)
+    const sliceTh = parseDecimalTag(dataSet, 'x00180050')
+    const spBetween = parseDecimalTag(dataSet, 'x00180088')
+
     return {
       file,
       fileName: file.name || 'Без имени',
@@ -126,6 +158,13 @@ export async function parseDicomFile(
       instanceNumber: readNumber(dataSet, 'x00200013'),
       imagePositionZ: readImagePositionZ(dataSet),
       patientName: readString(dataSet, 'x00100010', 'Не указан'),
+      patientId: readString(dataSet, 'x00100020', ''),
+      rows,
+      columns,
+      pixelSpacingX: ps.x,
+      pixelSpacingY: ps.y,
+      sliceThicknessMm: sliceTh,
+      spacingBetweenSlicesMm: spBetween,
     }
   } catch {
     return null
@@ -152,6 +191,7 @@ export async function buildSeries(files: File[]) {
       modality: item.modality,
       studyDate: item.studyDate,
       patientName: item.patientName,
+      patientId: item.patientId,
       files: [item],
     })
   }
@@ -172,4 +212,60 @@ export async function buildSeries(files: File[]) {
       }),
     }))
     .sort((a, b) => b.files.length - a.files.length)
+}
+
+/**
+ * Более надёжный разбор папки: не делаем двойное чтение файла (isDicomFile -> parseDicomFile),
+ * а сразу пытаемся распарсить метаданные. Это заметно увеличивает долю «подхваченных» срезов
+ * на больших исследованиях и ускоряет импорт.
+ */
+export async function buildSeriesWithRejects(files: File[]) {
+  const parsed = await Promise.all(files.map((file) => parseDicomFile(file)))
+  const accepted: ParsedDicomFile[] = []
+  const rejected: File[] = []
+  for (let i = 0; i < files.length; i += 1) {
+    const p = parsed[i]
+    if (p) accepted.push(p)
+    else rejected.push(files[i]!)
+  }
+
+  const seriesMap = new Map<string, DicomSeries>()
+  for (const item of accepted) {
+    const existing = seriesMap.get(item.seriesInstanceUid)
+    if (existing) {
+      existing.files.push(item)
+    } else {
+      seriesMap.set(item.seriesInstanceUid, {
+        seriesInstanceUid: item.seriesInstanceUid,
+        studyInstanceUid: item.studyInstanceUid,
+        seriesDescription: item.seriesDescription,
+        modality: item.modality,
+        studyDate: item.studyDate,
+        patientName: item.patientName,
+        patientId: item.patientId,
+        files: [item],
+      })
+    }
+  }
+
+  const seriesList = Array.from(seriesMap.values())
+    .map((series) => ({
+      ...series,
+      files: [...series.files].sort((a, b) => {
+        if (a.instanceNumber > 0 && b.instanceNumber > 0) {
+          return a.instanceNumber - b.instanceNumber
+        }
+        if (a.imagePositionZ !== null && b.imagePositionZ !== null) {
+          return a.imagePositionZ - b.imagePositionZ
+        }
+        return a.fileName.localeCompare(b.fileName)
+      }),
+    }))
+    .sort((a, b) => b.files.length - a.files.length)
+
+  return {
+    accepted: accepted.map((p) => p.file),
+    rejected,
+    seriesList,
+  }
 }

@@ -1,0 +1,12 @@
+# Базовый API + TotalSegmentator (тяжёлые зависимости: PyTorch, nnU-Net v2 backend).
+# Рекомендация: сначала поставить PyTorch с CUDA с https://pytorch.org , затем:
+#   pip install -r requirements.txt
+#   pip install -r requirements-totalsegmentator.txt
+#
+# Только CPU (медленно, для проверки контракта):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-totalsegmentator.txt
+
+-r requirements.txt
+
+TotalSegmentator>=2.3.0,<3

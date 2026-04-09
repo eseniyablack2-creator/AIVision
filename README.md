@@ -19,9 +19,11 @@
 - `docs/technical-spec.md` — основное ТЗ;
 - `docs/roadmap.md` — дорожная карта этапов;
 - `docs/clinical-requirements.md` — клинические сценарии и обязательные режимы;
+- `docs/technical-dossier-aivision.md` — полное техническое досье (структура «как iAorta»: проблема, архитектура, данные, риски, шпаргалка);
 - `docs/product-vision.md` — продуктовый ориентир уровня "лучший viewer";
 - `docs/omniview-reference.md` — полный референс функций OmniView XP;
-- `docs/step-01.md` — самый первый практический шаг.
+- `docs/step-01.md` — самый первый практический шаг;
+- `docs/awesome-dicom-for-aivision.md` — карта ресурсов из [awesome-dicom](https://github.com/open-dicom/awesome-dicom) под наш стек и дорожную карту.
 
 Текущая структура:
 - `frontend/` — клиентское приложение на React + TypeScript + Vite;
@@ -30,9 +32,18 @@
 Репозиторий: [github.com/eseniyablack2-creator/AIVision](https://github.com/eseniyablack2-creator/AIVision)
 
 Запуск локально:
+
+Из **корня репозитория** (после `npm install` внутри `frontend/`):
+```bash
+npm install --prefix frontend
+npm run dev
+```
+
+Или как раньше из папки приложения:
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
+
 Откройте в браузере адрес, который покажет Vite (обычно `http://localhost:5173/`).

@@ -1,0 +1,43 @@
+{
+  "aorta": {
+    "name": "Аорта и подвздошные артерии",
+    "hu_min": 150,
+    "hu_max": 800,
+    "requires_native": true,
+    "bone_removal_method": "mmbe",
+    "restore_calcium": true,
+    "color": "#FF4500",
+    "description": "Сегментация аорты с удалением позвоночника и ребер. Восстановление кальцификатов."
+  },
+  "vessels_general": {
+    "name": "Сосуды (Общие)",
+    "hu_min": 120,
+    "hu_max": 600,
+    "requires_native": true,
+    "bone_removal_method": "mmbe",
+    "restore_calcium": false,
+    "color": "#DC143C",
+    "description": "Для мелких сосудов шеи или ног. Менее агрессивное удаление."
+  },
+  "bones": {
+    "name": "Костная система",
+    "hu_min": 300,
+    "hu_max": 3000,
+    "requires_native": false,
+    "bone_removal_method": null,
+    "restore_calcium": false,
+    "color": "#F0E68C",
+    "description": "Полная сегментация скелета. Удаление мягких тканей."
+  },
+  "lungs": {
+    "name": "Лёгкие (Паренхима)",
+    "hu_min": -1000,
+    "hu_max": -400,
+    "requires_native": false,
+    "bone_removal_method": null,
+    "restore_calcium": false,
+    "color": "#ADD8E6",
+    "opacity": 0.7,
+    "description": "Сегментация воздушных полостей легких. Заполнение бронхов."
+  }
+}
