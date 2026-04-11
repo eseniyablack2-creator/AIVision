@@ -116,7 +116,7 @@ export function estimateTableCutRowsSingle(frame: CtSliceLike): number {
     if (rowIsTableLike(frame, y)) {
       run += 1
       if (run >= 3) {
-        cutFromBottom = Math.max(cutFromBottom, rows - y + 5)
+        cutFromBottom = Math.max(cutFromBottom, rows - y + 12)
       }
     } else {
       run = 0
@@ -175,16 +175,16 @@ export function estimateTableCutTopRowsSingle(frame: CtSliceLike): number {
 
 function columnCouchLike(frame: CtSliceLike, x: number): boolean {
   const { rows, columns, huPixels } = frame
-  const y0 = Math.floor(rows * 0.22)
-  const y1 = Math.floor(rows * 0.8)
+  const y0 = Math.floor(rows * 0.18)
+  const y1 = Math.floor(rows * 0.82)
   let high = 0
   let cnt = 0
   for (let y = y0; y < y1; y += 1) {
     const v = huPixels[y * columns + x]
-    if (v > 200) high += 1
+    if (v > 115) high += 1
     cnt += 1
   }
-  return cnt > 0 && high / cnt > 0.4
+  return cnt > 0 && high / cnt > 0.34
 }
 
 /** Узкие вертикальные полосы ложа слева/справа (вид «стола сзади» на коронале). */
@@ -192,7 +192,7 @@ export function estimateTableSideCutsSingle(frame: CtSliceLike): { left: number;
   const { columns } = frame
   if (columns < 16) return { left: 0, right: 0 }
 
-  const maxBand = Math.min(Math.floor(columns * 0.22), 48)
+  const maxBand = Math.min(Math.floor(columns * 0.3), 72)
   let left = 0
   for (let x = 0; x < maxBand; x += 1) {
     if (!columnCouchLike(frame, x)) break
@@ -204,12 +204,12 @@ export function estimateTableSideCutsSingle(frame: CtSliceLike): { left: number;
     right = columns - x
   }
 
-  const pad = 2
-  left = clamp(left + pad, 0, Math.floor(columns * 0.28))
-  right = clamp(right + pad, 0, Math.floor(columns * 0.28))
+  const pad = 5
+  left = clamp(left + pad, 0, Math.floor(columns * 0.34))
+  right = clamp(right + pad, 0, Math.floor(columns * 0.34))
 
-  if (left + right > Math.floor(columns * 0.42)) {
-    const scale = (Math.floor(columns * 0.42) - 1) / (left + right)
+  if (left + right > Math.floor(columns * 0.48)) {
+    const scale = (Math.floor(columns * 0.48) - 1) / (left + right)
     left = Math.floor(left * scale)
     right = Math.floor(right * scale)
   }

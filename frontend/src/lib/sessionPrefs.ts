@@ -4,6 +4,13 @@ import { normalizeVolume3dPresetId, type Volume3dPresetId } from './volume3dPres
 
 const KEY = 'aivision-workstation-prefs-v1'
 
+/**
+ * Верхняя граница HU для лассо «только кость».
+ * Значения вроде 2000 почти не затрагивают типичную кортикаль (~200–1800 HU) — кость визуально «не срезается».
+ */
+export const ENTERPRISE_LASSO_BONE_HU_MAX = 720
+export const ENTERPRISE_LASSO_BONE_HU_MIN = 150
+
 export type Enterprise3DPresetId = 'aorta' | 'vessels_general' | 'bones' | 'lungs'
 export type Enterprise3DNavigationMode = 'rotate' | 'pan'
 export type Enterprise3DSessionPrefs = {
@@ -22,6 +29,13 @@ export type Enterprise3DSessionPrefs = {
   opacityGain?: number
   /** Remove couch/table in 3D volume build */
   removeTable?: boolean
+  /**
+   * Лассо 3D: если true — в контуре обнуляются только воксели с HU ≥ lassoBoneHuMin (кость/кальций),
+   * мягкие ткани и контрастный просвет сохраняются.
+   */
+  lassoBoneOnly?: boolean
+  /** Порог HU для режима «только кость» в лассо (типично 280–480; не выше ENTERPRISE_LASSO_BONE_HU_MAX). */
+  lassoBoneHuMin?: number
 }
 
 export type WorkstationSessionPrefs = {
@@ -58,13 +72,12 @@ export type WorkstationSessionPrefs = {
   volRestoreCalcium?: boolean
   /** HU-порог кальция для CTA restore */
   volCalciumHuMin?: number
-  /** Сглаживание canvas при масштабе 2D (true = билинейная, false = ближайший сосед) */
+  /** @deprecated Игнорируется: 2D всегда без билинейного сглаживания. */
   interpolation2d?: boolean
-  /**
-   * «Супер-чёткий» 2D: привязка отрисовки к целым пикселям экрана (без дробных смещений),
-   * чтобы избежать скрытого ресэмплирования при nearest-neighbor.
-   */
+  /** @deprecated Поведение встроено: целочисленный dest для drawImage. */
   superCrisp2d?: boolean
+  /** Линии перекрёста MPR (жёлтые) между аксиальной / корональной / сагиттальной. */
+  showMprCrosslines?: boolean
 
   /** Новый enterprise-3D пайплайн (R3F + backend GLB). */
   enterprise3d?: Enterprise3DSessionPrefs
@@ -95,10 +108,17 @@ const defaultPrefs: WorkstationSessionPrefs = {
   volNavigationMode: 'rotate',
   volRestoreCalcium: true,
   volCalciumHuMin: 600,
-  /** По умолчанию билинейное/высококачественное масштабирование — меньше «пиксельности» при зуме. */
-  interpolation2d: true,
+  interpolation2d: false,
   superCrisp2d: true,
-  enterprise3d: { presetId: 'aorta', useAllSlices: true, navigationMode: 'rotate' },
+  showMprCrosslines: true,
+  enterprise3d: {
+    presetId: 'aorta',
+    useAllSlices: true,
+    navigationMode: 'rotate',
+    vesselBoost: 0.85,
+    boneTame: 1,
+    opacityGain: 1.15,
+  },
 }
 
 export function loadWorkstationPrefs(): WorkstationSessionPrefs {
@@ -114,6 +134,8 @@ export function loadWorkstationPrefs(): WorkstationSessionPrefs {
     const volColormapPreset = normalizeCtColormapStyle(rawMap)
     const volRenderQuality = normalizeVolRenderQualityTier(merged.volRenderQuality)
     const volPresetId = normalizeVolume3dPresetId(merged.volPresetId)
+    const showMprCrosslines =
+      typeof merged.showMprCrosslines === 'boolean' ? merged.showMprCrosslines : defaultPrefs.showMprCrosslines
     const e3dRaw = merged.enterprise3d ?? defaultPrefs.enterprise3d!
     const enterprise3d: Enterprise3DSessionPrefs = {
       presetId:
@@ -126,15 +148,33 @@ export function loadWorkstationPrefs(): WorkstationSessionPrefs {
       useAllSlices: Boolean(e3dRaw.useAllSlices),
       navigationMode: e3dRaw.navigationMode === 'pan' ? 'pan' : 'rotate',
       nativeSeriesUid: typeof e3dRaw.nativeSeriesUid === 'string' ? e3dRaw.nativeSeriesUid : undefined,
+      // 0 в старых сохранениях давал «мёртвый» angio-TF (vScale→min, кость без подавления).
       vesselBoost:
-        typeof e3dRaw.vesselBoost === 'number' ? Math.max(0, Math.min(1, e3dRaw.vesselBoost)) : undefined,
+        typeof e3dRaw.vesselBoost === 'number'
+          ? e3dRaw.vesselBoost < 0.08
+            ? undefined
+            : Math.max(0, Math.min(1, e3dRaw.vesselBoost))
+          : undefined,
       boneTame:
-        typeof e3dRaw.boneTame === 'number' ? Math.max(0, Math.min(1, e3dRaw.boneTame)) : undefined,
+        typeof e3dRaw.boneTame === 'number'
+          ? e3dRaw.boneTame < 0.08
+            ? undefined
+            : Math.max(0, Math.min(1, e3dRaw.boneTame))
+          : undefined,
       scalarShift: typeof e3dRaw.scalarShift === 'number' ? Math.max(-400, Math.min(400, e3dRaw.scalarShift)) : undefined,
       opacityGain: typeof e3dRaw.opacityGain === 'number' ? Math.max(0.25, Math.min(2.5, e3dRaw.opacityGain)) : undefined,
       removeTable: typeof e3dRaw.removeTable === 'boolean' ? e3dRaw.removeTable : undefined,
+      lassoBoneOnly: typeof e3dRaw.lassoBoneOnly === 'boolean' ? e3dRaw.lassoBoneOnly : undefined,
+      lassoBoneHuMin:
+        typeof e3dRaw.lassoBoneHuMin === 'number' && Number.isFinite(e3dRaw.lassoBoneHuMin)
+          ? (() => {
+              const r = Math.round(e3dRaw.lassoBoneHuMin)
+              if (r > ENTERPRISE_LASSO_BONE_HU_MAX) return 380
+              return Math.max(ENTERPRISE_LASSO_BONE_HU_MIN, Math.min(ENTERPRISE_LASSO_BONE_HU_MAX, r))
+            })()
+          : undefined,
     }
-    return { ...merged, volColormapPreset, volRenderQuality, volPresetId, enterprise3d }
+    return { ...merged, volColormapPreset, volRenderQuality, volPresetId, showMprCrosslines, enterprise3d }
   } catch {
     return { ...defaultPrefs }
   }

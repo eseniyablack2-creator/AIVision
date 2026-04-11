@@ -40,7 +40,12 @@ import type {
 } from '../lib/ctInferenceTypes'
 import { runLungVolumeQuantification, type LungVolumeQuantReport } from '../lib/ctLungQuantification'
 import { getPathologyRemoteApiBase } from '../lib/pathologyRemote'
-import { loadWorkstationPrefs, saveWorkstationPrefs } from '../lib/sessionPrefs'
+import {
+  ENTERPRISE_LASSO_BONE_HU_MAX,
+  ENTERPRISE_LASSO_BONE_HU_MIN,
+  loadWorkstationPrefs,
+  saveWorkstationPrefs,
+} from '../lib/sessionPrefs'
 import { estimateTableCutRowsForSlices } from '../lib/ctTableMask'
 import type { VolumePickPayload } from '../lib/volumePickTypes'
 import type { SimilarCasesFocusContext } from '../lib/similarCasesMock'
@@ -56,9 +61,9 @@ import {
   IconAngle,
   IconHuRoi,
   IconHuRoiPoly,
+  IconViewLasso,
   IconChevronDoubleLeft,
   IconChevronDoubleRight,
-  IconInterp2d,
   IconLayout1,
   IconLayoutGrid,
   IconLayoutMPR,
@@ -78,9 +83,25 @@ import {
   IconZoom,
 } from './WorkstationIcons'
 import { DicomTagsModal } from './DicomTagsModal'
-import { EnterpriseVolume3DViewport, type EnterpriseVolumePresetId } from './EnterpriseVolume3DViewport'
+import {
+  EnterpriseVolume3DViewport,
+  getEnterpriseVolumeDefaultParams,
+  type EnterpriseVolume3DViewportHandle,
+  type EnterpriseVolumePresetId,
+  type LassoRemoveOptions,
+} from './EnterpriseVolume3DViewport'
+import { ViewCubeSvg, type ViewCubeFace } from './ViewCubeSvg'
+import { buildSmoothLassoFromStroke, chaikinOpen } from '../lib/volumeLassoBezier'
 
-type ToolMode = 'windowLevel' | 'pan' | 'zoom' | 'length' | 'angle' | 'huRoi' | 'huRoiPoly'
+type ToolMode =
+  | 'windowLevel'
+  | 'pan'
+  | 'zoom'
+  | 'length'
+  | 'angle'
+  | 'huRoi'
+  | 'huRoiPoly'
+  | 'viewLasso'
 type LayoutMode = 'single' | 'grid' | 'mpr'
 type WorkspaceMode = 'diagnostic' | 'cta3d' | 'airway3d'
 type VolumeNavigationMode = 'rotate' | 'pan'
@@ -200,7 +221,14 @@ const TOOL_ITEMS: Array<{ id: ToolMode; title: string }> = [
   },
   { id: 'huRoi', title: 'ROI: средний HU по срезу (прямоугольник)' },
   { id: 'huRoiPoly', title: 'ROI: полигон HU (клик — вершины, 2×ЛКМ или замкнуть у первой)' },
+  {
+    id: 'viewLasso',
+    title:
+      'Лассо 3D: контур на экране — вырезание из объёма. В панели «3D» включите «Только кость (HU ≥)», чтобы убрать рёбра, не трогая сосуды в контуре. Клавиша 8; ПКМ — шаг назад; Esc — сброс',
+  },
 ]
+
+const TOOL_ITEMS_2D = TOOL_ITEMS.filter((item) => item.id !== 'viewLasso')
 
 const LAYOUT_ITEMS: Array<{ id: LayoutMode; title: string }> = [
   { id: 'single', title: 'Одно окно' },
@@ -242,12 +270,19 @@ function toolIcon(id: ToolMode) {
   if (id === 'length') return <IconRuler className={c} />
   if (id === 'angle') return <IconAngle className={c} />
   if (id === 'huRoi') return <IconHuRoi className={c} />
+  if (id === 'viewLasso') return <IconViewLasso className={c} />
   return <IconHuRoiPoly className={c} />
 }
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
 }
+
+const ENTERPRISE_HU_SHIFT_MIN = -250
+const ENTERPRISE_HU_SHIFT_MAX = 250
+/** Проценты непрозрачности DVR: ползунок + ручной ввод (как на ПАКС). */
+const ENTERPRISE_OPACITY_PCT_MIN = 25
+const ENTERPRISE_OPACITY_PCT_MAX = 260
 
 function pathologyEmphasisFromSlice(
   frames: LoadedFrame[],
@@ -304,6 +339,7 @@ function getCanvasCursor(tool: ToolMode, spaceDown: boolean) {
   if (tool === 'angle') return 'cursor-angle'
   if (tool === 'huRoi') return 'cursor-huRoi'
   if (tool === 'huRoiPoly') return 'cursor-huRoi'
+  if (tool === 'viewLasso') return 'cursor-crosshair'
   return 'cursor-wl'
 }
 
@@ -595,7 +631,7 @@ function buildSagittalProjection(
   }
 }
 
-export function DicomViewport({
+function DicomViewport({
   activeSeries,
   nativeSeries = null,
   allSeries = [],
@@ -659,6 +695,9 @@ export function DicomViewport({
   const [segEnabled, setSegEnabled] = useState(() => loadWorkstationPrefs().segEnabled)
   const [segHuMin, setSegHuMin] = useState(() => loadWorkstationPrefs().segHuMin)
   const [segHuMax, setSegHuMax] = useState(() => loadWorkstationPrefs().segHuMax)
+  const [showMprCrosslines, setShowMprCrosslines] = useState(
+    () => loadWorkstationPrefs().showMprCrosslines ?? true,
+  )
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false)
   const lastVolumeModeRef = useRef<WorkspaceMode>('cta3d')
   useEffect(() => {
@@ -694,6 +733,10 @@ export function DicomViewport({
     }
   }, [spaceDown])
 
+  useEffect(() => {
+    saveWorkstationPrefs({ showMprCrosslines })
+  }, [showMprCrosslines])
+
   // Новый 3D-пайплайн (vtk.js volume ray casting): 4 enterprise-пресета.
   const [enterprisePresetId, setEnterprisePresetId] = useState<EnterpriseVolumePresetId>(
     () => loadWorkstationPrefs().enterprise3d?.presetId ?? 'aorta',
@@ -704,6 +747,7 @@ export function DicomViewport({
   const [enterpriseNavigationMode, setEnterpriseNavigationMode] = useState<VolumeNavigationMode>(
     () => loadWorkstationPrefs().enterprise3d?.navigationMode ?? 'rotate',
   )
+  const [enterpriseOrientFace, setEnterpriseOrientFace] = useState<ViewCubeFace>('anterior')
   const [enterpriseRebuildTick, setEnterpriseRebuildTick] = useState(0)
 
   const [enterpriseScalarShift, setEnterpriseScalarShift] = useState(
@@ -712,22 +756,40 @@ export function DicomViewport({
   const [enterpriseOpacityGain, setEnterpriseOpacityGain] = useState(
     () => loadWorkstationPrefs().enterprise3d?.opacityGain ?? 1.15,
   )
-  const [enterpriseVesselBoost, setEnterpriseVesselBoost] = useState(
-    () => loadWorkstationPrefs().enterprise3d?.vesselBoost ?? 0.8,
-  )
-  const [enterpriseBoneTame, setEnterpriseBoneTame] = useState(
-    () => loadWorkstationPrefs().enterprise3d?.boneTame ?? 0.9,
-  )
+  const [enterpriseVesselBoost, setEnterpriseVesselBoost] = useState(() => {
+    const v = loadWorkstationPrefs().enterprise3d?.vesselBoost
+    if (typeof v === 'number' && v < 0.08) return 0.85
+    return v ?? 0.85
+  })
+  const [enterpriseBoneTame, setEnterpriseBoneTame] = useState(() => {
+    const b = loadWorkstationPrefs().enterprise3d?.boneTame
+    if (typeof b === 'number' && b < 0.08) return 1
+    return b ?? 1
+  })
   const [enterpriseRemoveTable, setEnterpriseRemoveTable] = useState(
     () => loadWorkstationPrefs().enterprise3d?.removeTable ?? true,
   )
-  const [interpolation2d, setInterpolation2d] = useState(
-    () => loadWorkstationPrefs().interpolation2d ?? false,
+  const [enterpriseLassoBoneOnly, setEnterpriseLassoBoneOnly] = useState(
+    () => loadWorkstationPrefs().enterprise3d?.lassoBoneOnly ?? false,
   )
-  const [superCrisp2d, setSuperCrisp2d] = useState(
-    () => loadWorkstationPrefs().superCrisp2d ?? true,
+  const [enterpriseLassoBoneHuMin, setEnterpriseLassoBoneHuMin] = useState(
+    () => loadWorkstationPrefs().enterprise3d?.lassoBoneHuMin ?? 320,
   )
-
+  const prevEnterprisePresetIdRef = useRef<EnterpriseVolumePresetId | null>(null)
+  /**
+   * Слайдеры 3D хранятся в состоянии; при смене пресета подставляем его базовые TF-параметры целиком.
+   * Иначе boneTame/vesselBoost от «Аорты» (например 1) остаются на «Костях» (где нужно ~0.15) — все режимы выглядят «сломанными».
+   */
+  useEffect(() => {
+    const prev = prevEnterprisePresetIdRef.current
+    prevEnterprisePresetIdRef.current = enterprisePresetId
+    if (prev === null || prev === enterprisePresetId) return
+    const d = getEnterpriseVolumeDefaultParams(enterprisePresetId)
+    setEnterpriseBoneTame(d.boneTame)
+    setEnterpriseVesselBoost(d.vesselBoost)
+    setEnterpriseOpacityGain(d.opacityGain)
+    setEnterpriseScalarShift(d.scalarShift)
+  }, [enterprisePresetId])
   useEffect(() => {
     saveWorkstationPrefs({
       enterprise3d: {
@@ -740,6 +802,8 @@ export function DicomViewport({
         vesselBoost: enterpriseVesselBoost,
         boneTame: enterpriseBoneTame,
         removeTable: enterpriseRemoveTable,
+        lassoBoneOnly: enterpriseLassoBoneOnly,
+        lassoBoneHuMin: enterpriseLassoBoneHuMin,
       },
     })
   }, [
@@ -752,6 +816,8 @@ export function DicomViewport({
     enterpriseVesselBoost,
     enterpriseBoneTame,
     enterpriseRemoveTable,
+    enterpriseLassoBoneOnly,
+    enterpriseLassoBoneHuMin,
   ])
   /** Управление DVR в vtk: сдвиг шкалы HU и усиление непрозрачности (отдельно от 2D W/L). */
   const [volScalarShift, setVolScalarShift] = useState(0)
@@ -812,6 +878,190 @@ export function DicomViewport({
   const [huRoiPolyDraftSliceZ, setHuRoiPolyDraftSliceZ] = useState<number | null>(null)
   const [huRoiPolyFinal, setHuRoiPolyFinal] = useState<{ points: Point[]; sliceZ: number } | null>(null)
   const [huRoiPolyHover, setHuRoiPolyHover] = useState<Point | null>(null)
+  /** Лассо в 3D: контур в нормализованных координатах (0–1) относительно стека объёма. */
+  const [viewLassoMask3d, setViewLassoMask3d] = useState<{ pointsNorm: Point[] } | null>(null)
+  /** Тик для перерисовки оверлея лассо (ref + rAF). */
+  const [lassoPaintTick, setLassoPaintTick] = useState(0)
+  const viewLasso3dDrawingRef = useRef(false)
+  const viewLasso3dDraftNormRef = useRef<Point[]>([])
+  const volumeStackRef = useRef<HTMLDivElement | null>(null)
+  const lasso3dCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const enterpriseVolRef = useRef<EnterpriseVolume3DViewportHandle | null>(null)
+  const onEnterpriseViewCubeFace = useCallback((face: ViewCubeFace) => {
+    setEnterpriseOrientFace(face)
+    enterpriseVolRef.current?.snapToPatientView(face)
+  }, [])
+  const lassoRafRef = useRef<number | null>(null)
+  const [lassoCutBusy, setLassoCutBusy] = useState(false)
+
+  const polyHoverRafRef = useRef<number | null>(null)
+  const polyHoverPendingRef = useRef<Point | null>(null)
+  const angleHoverRafRef = useRef<number | null>(null)
+  const angleHoverPendingRef = useRef<Point | null>(null)
+  const huRoiPreviewRafRef = useRef<number | null>(null)
+  const huRoiPreviewPendingRef = useRef<Point | null>(null)
+  const measPreviewRafRef = useRef<number | null>(null)
+  const measPreviewPendingRef = useRef<Point | null>(null)
+
+  function schedulePolyHover(p: Point) {
+    polyHoverPendingRef.current = p
+    if (polyHoverRafRef.current != null) return
+    polyHoverRafRef.current = requestAnimationFrame(() => {
+      polyHoverRafRef.current = null
+      const v = polyHoverPendingRef.current
+      if (v) setHuRoiPolyHover(v)
+    })
+  }
+
+  function scheduleAngleHover(p: Point) {
+    angleHoverPendingRef.current = p
+    if (angleHoverRafRef.current != null) return
+    angleHoverRafRef.current = requestAnimationFrame(() => {
+      angleHoverRafRef.current = null
+      const v = angleHoverPendingRef.current
+      if (v) setAngleHover(v)
+    })
+  }
+
+  function scheduleHuRoiPreview(p: Point) {
+    huRoiPreviewPendingRef.current = p
+    if (huRoiPreviewRafRef.current != null) return
+    huRoiPreviewRafRef.current = requestAnimationFrame(() => {
+      huRoiPreviewRafRef.current = null
+      const v = huRoiPreviewPendingRef.current
+      if (v) setHuRoiPreview(v)
+    })
+  }
+
+  function scheduleMeasurementPreview(p: Point) {
+    measPreviewPendingRef.current = p
+    if (measPreviewRafRef.current != null) return
+    measPreviewRafRef.current = requestAnimationFrame(() => {
+      measPreviewRafRef.current = null
+      const v = measPreviewPendingRef.current
+      if (v) setMeasurementPreview(v)
+    })
+  }
+
+  function cancelPointerMoveRafs() {
+    if (polyHoverRafRef.current != null) {
+      cancelAnimationFrame(polyHoverRafRef.current)
+      polyHoverRafRef.current = null
+    }
+    polyHoverPendingRef.current = null
+    if (angleHoverRafRef.current != null) {
+      cancelAnimationFrame(angleHoverRafRef.current)
+      angleHoverRafRef.current = null
+    }
+    angleHoverPendingRef.current = null
+    if (huRoiPreviewRafRef.current != null) {
+      cancelAnimationFrame(huRoiPreviewRafRef.current)
+      huRoiPreviewRafRef.current = null
+    }
+    huRoiPreviewPendingRef.current = null
+    if (measPreviewRafRef.current != null) {
+      cancelAnimationFrame(measPreviewRafRef.current)
+      measPreviewRafRef.current = null
+    }
+    measPreviewPendingRef.current = null
+  }
+
+  function scheduleLassoRedraw() {
+    if (lassoRafRef.current != null) return
+    lassoRafRef.current = requestAnimationFrame(() => {
+      lassoRafRef.current = null
+      setLassoPaintTick((n) => n + 1)
+    })
+  }
+
+  function getNormPointInVolumeStack(event: React.MouseEvent): Point | null {
+    const el = volumeStackRef.current
+    if (!el) return null
+    const r = el.getBoundingClientRect()
+    if (r.width <= 0 || r.height <= 0) return null
+    return {
+      x: clamp((event.clientX - r.left) / r.width, 0, 1),
+      y: clamp((event.clientY - r.top) / r.height, 0, 1),
+    }
+  }
+
+  const paintVolumeLasso3dOverlay = useCallback(() => {
+    const canvas = lasso3dCanvasRef.current
+    const stack = volumeStackRef.current
+    if (!canvas || !stack) return
+    const rect = stack.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return
+
+    const dpr = Math.max(1, window.devicePixelRatio || 1)
+    const bw = Math.max(1, Math.floor(rect.width * dpr))
+    const bh = Math.max(1, Math.floor(rect.height * dpr))
+    if (canvas.width !== bw || canvas.height !== bh) {
+      canvas.width = bw
+      canvas.height = bh
+      canvas.style.width = `${rect.width}px`
+      canvas.style.height = `${rect.height}px`
+    }
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, rect.width, rect.height)
+
+    if (workspaceMode === 'diagnostic') return
+
+    const toSx = (p: Point) => p.x * rect.width
+    const toSy = (p: Point) => p.y * rect.height
+
+    const maskPts = viewLassoMask3d?.pointsNorm
+    if (maskPts && maskPts.length >= 3) {
+      ctx.save()
+      ctx.beginPath()
+      ctx.moveTo(toSx(maskPts[0]!), toSy(maskPts[0]!))
+      for (let i = 1; i < maskPts.length; i += 1) {
+        ctx.lineTo(toSx(maskPts[i]!), toSy(maskPts[i]!))
+      }
+      ctx.closePath()
+      ctx.fillStyle = 'rgba(220, 60, 60, 0.38)'
+      ctx.fill()
+      ctx.strokeStyle = 'rgba(254, 240, 138, 0.95)'
+      ctx.lineWidth = 2
+      ctx.stroke()
+      ctx.restore()
+    }
+
+    const draftPts =
+      viewLasso3dDrawingRef.current && viewLasso3dDraftNormRef.current.length >= 2
+        ? chaikinOpen(viewLasso3dDraftNormRef.current, 2)
+        : null
+    if (draftPts) {
+      ctx.save()
+      ctx.strokeStyle = 'rgba(251, 191, 36, 0.95)'
+      ctx.lineWidth = 2
+      ctx.setLineDash([5, 4])
+      ctx.beginPath()
+      ctx.moveTo(toSx(draftPts[0]!), toSy(draftPts[0]!))
+      for (let i = 1; i < draftPts.length; i += 1) {
+        ctx.lineTo(toSx(draftPts[i]!), toSy(draftPts[i]!))
+      }
+      ctx.stroke()
+      ctx.setLineDash([])
+      ctx.restore()
+    }
+  }, [workspaceMode, viewLassoMask3d, lassoPaintTick])
+
+  useLayoutEffect(() => {
+    paintVolumeLasso3dOverlay()
+  }, [paintVolumeLasso3dOverlay])
+
+  useLayoutEffect(() => {
+    const stack = volumeStackRef.current
+    if (!stack || workspaceMode === 'diagnostic') return
+    const ro = new ResizeObserver(() => {
+      paintVolumeLasso3dOverlay()
+    })
+    ro.observe(stack)
+    return () => ro.disconnect()
+  }, [workspaceMode, paintVolumeLasso3dOverlay])
+
   /** Угол: последовательность точек A–B–C, угол в B между BA и BC. */
   const [anglePoints, setAnglePoints] = useState<Point[]>([])
   const [angleDraftSliceZ, setAngleDraftSliceZ] = useState<number | null>(null)
@@ -843,6 +1093,9 @@ export function DicomViewport({
       setWorkspaceMode(id)
       setExpandedViewport(null)
       setCinePlaying(false)
+      if (id === 'diagnostic') {
+        setActiveTool((t) => (t === 'viewLasso' ? 'windowLevel' : t))
+      }
       if (id !== 'diagnostic') {
         setLayoutMode('mpr')
         const nextPreset = id === 'cta3d' ? 'vessels' : 'lung'
@@ -1421,7 +1674,7 @@ export function DicomViewport({
         clinicalViewModeIdActive === 'lung' ? runLungVolumeQuantification(frames) : null
 
       const base = getPathologyRemoteApiBase()
-      if (local && base && activeSeries) {
+      if (local && activeSeries) {
         const f0 = frames[0]
         const payload = buildCtScreenPayload(frames, {
           seriesInstanceUid: activeSeries.seriesInstanceUid,
@@ -1798,6 +2051,10 @@ export function DicomViewport({
         setAnglePoints([])
         setAngleDraftSliceZ(null)
         setAngleHover(null)
+        viewLasso3dDrawingRef.current = false
+        viewLasso3dDraftNormRef.current = []
+        setViewLassoMask3d(null)
+        setLassoPaintTick((n) => n + 1)
         return
       }
 
@@ -1838,6 +2095,11 @@ export function DicomViewport({
           setActiveTool(tool)
         }
       }
+
+      if (workspaceMode !== 'diagnostic' && frames.length > 0 && ev.code === 'Digit8') {
+        ev.preventDefault()
+        setActiveTool('viewLasso')
+      }
     }
 
     window.addEventListener('keydown', onKeyDown)
@@ -1847,7 +2109,18 @@ export function DicomViewport({
   useEffect(() => {
     if (activeTool !== 'huRoiPoly') setHuRoiPolyHover(null)
     if (activeTool !== 'angle') setAngleHover(null)
+    if (activeTool !== 'viewLasso') {
+      viewLasso3dDrawingRef.current = false
+      viewLasso3dDraftNormRef.current = []
+      setLassoPaintTick((n) => n + 1)
+    }
   }, [activeTool])
+
+  useEffect(() => {
+    return () => {
+      if (lassoRafRef.current != null) cancelAnimationFrame(lassoRafRef.current)
+    }
+  }, [])
 
   useEffect(() => {
     const handlePointerMove = (event: PointerEvent) => {
@@ -1881,10 +2154,15 @@ export function DicomViewport({
     }
   }, [])
 
-  function prepareCanvas(canvas: HTMLCanvasElement | null, rect: PaneRect, smoothScaling: boolean) {
+  /**
+   * 2D КТ: полный devicePixelRatio и целочисленный dest в drawImage (getDrawMetrics).
+   * При увеличении кадра относительно исходного разрешения включается высококачественная интерполяция
+   * (меньше «лесенки» и зернистости при типичном fit-to-window для 512²).
+   */
+  function prepareCanvas(canvas: HTMLCanvasElement | null, rect: PaneRect) {
     if (!canvas || rect.width <= 0 || rect.height <= 0) return null
 
-    const dpr = window.devicePixelRatio || 1
+    const dpr = Math.max(1, window.devicePixelRatio || 1)
     const backingWidth = Math.max(1, Math.floor(rect.width * dpr))
     const backingHeight = Math.max(1, Math.floor(rect.height * dpr))
 
@@ -1895,14 +2173,11 @@ export function DicomViewport({
       canvas.style.height = `${rect.height}px`
     }
 
-    const context = canvas.getContext('2d')
+    const context = canvas.getContext('2d', { alpha: false })
     if (!context) return null
 
     context.setTransform(dpr, 0, 0, dpr, 0, 0)
-    context.imageSmoothingEnabled = smoothScaling
-    if (smoothScaling) {
-      context.imageSmoothingQuality = 'high'
-    }
+    context.imageSmoothingEnabled = false
     return context
   }
 
@@ -1940,17 +2215,11 @@ export function DicomViewport({
     let baseX = (rect.width - drawWidth) / 2 + state.panX
     let baseY = (rect.height - drawHeight) / 2 + state.panY
 
-    const snapPixels =
-      workspaceMode === 'diagnostic' &&
-      superCrisp2d &&
-      // Супер-чёткость важна, когда мы уже не сглаживаем и можем избежать дробного ресэмплинга.
-      !interpolation2d
-    if (snapPixels) {
-      baseX = Math.round(baseX)
-      baseY = Math.round(baseY)
-      drawWidth = Math.round(drawWidth)
-      drawHeight = Math.round(drawHeight)
-    }
+    // Целые пиксели в координатах CSS после setTransform(dpr): без субпиксельного размытия при drawImage.
+    baseX = Math.round(baseX)
+    baseY = Math.round(baseY)
+    drawWidth = Math.max(1, Math.round(drawWidth))
+    drawHeight = Math.max(1, Math.round(drawHeight))
 
     return {
       drawScale,
@@ -1991,9 +2260,7 @@ export function DicomViewport({
 
     if (!canvas || !data || rect.width <= 0 || rect.height <= 0 || frames.length === 0) return
 
-    // Сглаживание управляется кнопкой интерполяции: выкл. = чёткие пиксели (как NN), вкл. = плавный зум.
-    const smooth2d = interpolation2d
-    const context = prepareCanvas(canvas, rect, smooth2d)
+    const context = prepareCanvas(canvas, rect)
     if (!context) return
 
     const frame = frames[0]
@@ -2030,6 +2297,9 @@ export function DicomViewport({
     context.fillRect(0, 0, rect.width, rect.height)
 
     const metrics = getDrawMetrics(viewport, data, rect)
+    const useSmooth2dUpscale =
+      metrics.drawWidth > metrics.srcW * 1.008 || metrics.drawHeight > metrics.srcH * 1.008
+    canvas.style.imageRendering = useSmooth2dUpscale ? 'auto' : 'crisp-edges'
 
     function drawSliceLayer(
       c: CanvasRenderingContext2D,
@@ -2040,28 +2310,24 @@ export function DicomViewport({
       srcH: number,
       layer?: { globalAlpha?: number; composite?: GlobalCompositeOperation },
     ) {
+      const bx = metrics.baseX
+      const by = metrics.baseY
+      const dw = metrics.drawWidth
+      const dh = metrics.drawHeight
       c.save()
       if (layer?.globalAlpha != null) c.globalAlpha = layer.globalAlpha
       if (layer?.composite) c.globalCompositeOperation = layer.composite
+      c.imageSmoothingEnabled = useSmooth2dUpscale
+      if (useSmooth2dUpscale && 'imageSmoothingQuality' in c) {
+        ;(c as CanvasRenderingContext2D & { imageSmoothingQuality: string }).imageSmoothingQuality =
+          'high'
+      }
       if (metrics.flipH || metrics.flipV) {
-        c.translate(
-          metrics.baseX + (metrics.flipH ? metrics.drawWidth : 0),
-          metrics.baseY + (metrics.flipV ? metrics.drawHeight : 0),
-        )
+        c.translate(bx + (metrics.flipH ? dw : 0), by + (metrics.flipV ? dh : 0))
         c.scale(metrics.flipH ? -1 : 1, metrics.flipV ? -1 : 1)
-        c.drawImage(src, srcX, srcY, srcW, srcH, 0, 0, metrics.drawWidth, metrics.drawHeight)
+        c.drawImage(src, srcX, srcY, srcW, srcH, 0, 0, dw, dh)
       } else {
-        c.drawImage(
-          src,
-          srcX,
-          srcY,
-          srcW,
-          srcH,
-          metrics.baseX,
-          metrics.baseY,
-          metrics.drawWidth,
-          metrics.drawHeight,
-        )
+        c.drawImage(src, srcX, srcY, srcW, srcH, bx, by, dw, dh)
       }
       c.restore()
     }
@@ -2233,38 +2499,40 @@ export function DicomViewport({
       }
     }
 
-    context.strokeStyle = '#d8ba4d'
-    context.lineWidth = 1
-    context.beginPath()
-    if (viewport === 'axial' || viewport === 'axialAlt') {
-      const vx = imageXToScreen(effectiveCrosshair.x, metrics)
-      context.moveTo(vx, metrics.baseY)
-      context.lineTo(vx, metrics.baseY + metrics.drawHeight)
-      const hy = imageYToScreen(effectiveCrosshair.y, metrics)
-      context.moveTo(metrics.baseX, hy)
-      context.lineTo(metrics.baseX + metrics.drawWidth, hy)
-    } else if (viewport === 'coronal') {
-      const vx = imageXToScreen(effectiveCrosshair.x, metrics)
-      context.moveTo(vx, metrics.baseY)
-      context.lineTo(vx, metrics.baseY + metrics.drawHeight)
-      const zS = workspaceMode === 'diagnostic' ? 0 : clipBounds.start
-      const zE =
-        frames.length === 0 ? 0 : workspaceMode === 'diagnostic' ? frames.length - 1 : clipBounds.end
-      const hy = imageYToScreen(axialSliceZToMprRow(sliceZ, zS, zE), metrics)
-      context.moveTo(metrics.baseX, hy)
-      context.lineTo(metrics.baseX + metrics.drawWidth, hy)
-    } else {
-      const vx = imageXToScreen(effectiveCrosshair.y, metrics)
-      context.moveTo(vx, metrics.baseY)
-      context.lineTo(vx, metrics.baseY + metrics.drawHeight)
-      const zS = workspaceMode === 'diagnostic' ? 0 : clipBounds.start
-      const zE =
-        frames.length === 0 ? 0 : workspaceMode === 'diagnostic' ? frames.length - 1 : clipBounds.end
-      const hy = imageYToScreen(axialSliceZToMprRow(sliceZ, zS, zE), metrics)
-      context.moveTo(metrics.baseX, hy)
-      context.lineTo(metrics.baseX + metrics.drawWidth, hy)
+    if (showMprCrosslines) {
+      context.strokeStyle = '#d8ba4d'
+      context.lineWidth = 1
+      context.beginPath()
+      if (viewport === 'axial' || viewport === 'axialAlt') {
+        const vx = imageXToScreen(effectiveCrosshair.x, metrics)
+        context.moveTo(vx, metrics.baseY)
+        context.lineTo(vx, metrics.baseY + metrics.drawHeight)
+        const hy = imageYToScreen(effectiveCrosshair.y, metrics)
+        context.moveTo(metrics.baseX, hy)
+        context.lineTo(metrics.baseX + metrics.drawWidth, hy)
+      } else if (viewport === 'coronal') {
+        const vx = imageXToScreen(effectiveCrosshair.x, metrics)
+        context.moveTo(vx, metrics.baseY)
+        context.lineTo(vx, metrics.baseY + metrics.drawHeight)
+        const zS = workspaceMode === 'diagnostic' ? 0 : clipBounds.start
+        const zE =
+          frames.length === 0 ? 0 : workspaceMode === 'diagnostic' ? frames.length - 1 : clipBounds.end
+        const hy = imageYToScreen(axialSliceZToMprRow(sliceZ, zS, zE), metrics)
+        context.moveTo(metrics.baseX, hy)
+        context.lineTo(metrics.baseX + metrics.drawWidth, hy)
+      } else {
+        const vx = imageXToScreen(effectiveCrosshair.y, metrics)
+        context.moveTo(vx, metrics.baseY)
+        context.lineTo(vx, metrics.baseY + metrics.drawHeight)
+        const zS = workspaceMode === 'diagnostic' ? 0 : clipBounds.start
+        const zE =
+          frames.length === 0 ? 0 : workspaceMode === 'diagnostic' ? frames.length - 1 : clipBounds.end
+        const hy = imageYToScreen(axialSliceZToMprRow(sliceZ, zS, zE), metrics)
+        context.moveTo(metrics.baseX, hy)
+        context.lineTo(metrics.baseX + metrics.drawWidth, hy)
+      }
+      context.stroke()
     }
-    context.stroke()
 
     context.save()
     const frHud = frames[sliceZ]
@@ -2579,7 +2847,6 @@ export function DicomViewport({
     angleFinal,
     angleHover,
     activeTool,
-    interpolation2d,
     workspaceMode,
     axialData,
     coronalData,
@@ -2598,6 +2865,7 @@ export function DicomViewport({
     pathologyEmphasis,
     activeSlicePathology,
     layoutMode,
+    showMprCrosslines,
   ])
 
   useEffect(() => {
@@ -2875,14 +3143,14 @@ export function DicomViewport({
       (viewport === 'axial' || viewport === 'axialAlt') &&
       (huRoiPolyPoints.length === 0 || huRoiPolyDraftSliceZ === sliceZ)
     ) {
-      setHuRoiPolyHover(getMousePoint(event, viewport, data))
+      schedulePolyHover(getMousePoint(event, viewport, data))
     }
     if (
       activeTool === 'angle' &&
       workspaceMode === 'diagnostic' &&
       (viewport === 'axial' || viewport === 'axialAlt')
     ) {
-      setAngleHover(getMousePoint(event, viewport, data))
+      scheduleAngleHover(getMousePoint(event, viewport, data))
     }
     if (!dragStartRef.current) {
       updatePathologyHover(event, viewport, data)
@@ -2947,7 +3215,7 @@ export function DicomViewport({
     }
 
     if (activeTool === 'length' && (viewport === 'axial' || viewport === 'axialAlt')) {
-      setMeasurementPreview(getMousePoint(event, viewport, data))
+      scheduleMeasurementPreview(getMousePoint(event, viewport, data))
     }
 
     if (
@@ -2955,7 +3223,7 @@ export function DicomViewport({
       (viewport === 'axial' || viewport === 'axialAlt') &&
       huRoiSliceZRef.current === sliceZ
     ) {
-      setHuRoiPreview(getMousePoint(event, viewport, data))
+      scheduleHuRoiPreview(getMousePoint(event, viewport, data))
     }
   }
 
@@ -2993,6 +3261,91 @@ export function DicomViewport({
     huRoiStartRef.current = null
     setMeasurementPreview(null)
     setHuRoiPreview(null)
+  }
+
+  function handleVolumeLassoPointerDown(event: React.MouseEvent<HTMLCanvasElement>) {
+    if (workspaceMode === 'diagnostic' || activeTool !== 'viewLasso' || event.button !== 0) return
+    event.preventDefault()
+    const p = getNormPointInVolumeStack(event)
+    if (!p) return
+    viewLasso3dDrawingRef.current = true
+    viewLasso3dDraftNormRef.current = [p]
+    setViewLassoMask3d(null)
+    scheduleLassoRedraw()
+  }
+
+  function handleVolumeLassoPointerMove(event: React.MouseEvent<HTMLCanvasElement>) {
+    if (
+      !viewLasso3dDrawingRef.current ||
+      workspaceMode === 'diagnostic' ||
+      activeTool !== 'viewLasso'
+    ) {
+      return
+    }
+    const p = getNormPointInVolumeStack(event)
+    if (!p) return
+    const d = viewLasso3dDraftNormRef.current
+    const last = d[d.length - 1]
+    if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= 0.0025) {
+      d.push(p)
+      scheduleLassoRedraw()
+    }
+  }
+
+  async function finalizeVolumeLassoStroke() {
+    viewLasso3dDrawingRef.current = false
+    const pts = [...viewLasso3dDraftNormRef.current]
+    viewLasso3dDraftNormRef.current = []
+    setLassoPaintTick((n) => n + 1)
+    if (pts.length < 8) return
+    const smooth = buildSmoothLassoFromStroke(pts)
+    if (smooth.length < 8) return
+    setViewLassoMask3d({ pointsNorm: smooth })
+    setLassoPaintTick((n) => n + 1)
+    setLassoCutBusy(true)
+    setViewerError('')
+    try {
+      const api = enterpriseVolRef.current
+      if (!api) {
+        setViewerError('3D-рендерер ещё не готов — подождите окончания построения объёма.')
+        return
+      }
+      const lassoOpts: LassoRemoveOptions = {
+        mode: enterpriseLassoBoneOnly ? 'boneOnly' : 'all',
+        boneHuMin: enterpriseLassoBoneHuMin,
+      }
+      const res = await api.applyLassoRemoveInterior(smooth, lassoOpts)
+      if (!res.ok) {
+        setViewerError(res.message)
+      }
+    } finally {
+      setLassoCutBusy(false)
+      setViewLassoMask3d(null)
+      setLassoPaintTick((n) => n + 1)
+    }
+  }
+
+  function handleVolumeLassoPointerUp(event: React.MouseEvent<HTMLCanvasElement>) {
+    if (event.button !== 0) return
+    if (!viewLasso3dDrawingRef.current) return
+    void finalizeVolumeLassoStroke()
+  }
+
+  function handleVolumeLassoPointerLeave() {
+    if (!viewLasso3dDrawingRef.current) return
+    void finalizeVolumeLassoStroke()
+  }
+
+  function handleVolumeLassoContextMenu(event: React.MouseEvent<HTMLCanvasElement>) {
+    if (workspaceMode === 'diagnostic' || activeTool !== 'viewLasso') return
+    event.preventDefault()
+    if (viewLasso3dDraftNormRef.current.length > 0) {
+      viewLasso3dDraftNormRef.current = viewLasso3dDraftNormRef.current.slice(0, -1)
+      scheduleLassoRedraw()
+    } else {
+      setViewLassoMask3d(null)
+      setLassoPaintTick((n) => n + 1)
+    }
   }
 
   function handleWheel(event: React.WheelEvent<HTMLCanvasElement>, viewport: ViewportKind) {
@@ -3248,6 +3601,7 @@ export function DicomViewport({
           }
           onMouseLeave={(event) => {
             setPathologyTooltip(null)
+            cancelPointerMoveRafs()
             setHuRoiPolyHover(null)
             setAngleHover(null)
             handlePointerUp(
@@ -3277,6 +3631,7 @@ export function DicomViewport({
                 return next
               })
               setAngleHover(null)
+              return
             }
           }}
           onWheel={(event) => handleWheel(event, viewport)}
@@ -3325,8 +3680,7 @@ export function DicomViewport({
       segEnabled,
       segHuMin,
       segHuMax,
-      interpolation2d,
-      superCrisp2d,
+      showMprCrosslines,
     })
   }
 
@@ -3484,25 +3838,60 @@ export function DicomViewport({
                 ) : null}
               </div>
             ) : (
-              <EnterpriseVolume3DViewport
-                activeSeries={activeSeries}
-                nativeSeries={nativeSeries}
-                presetId={enterprisePresetId}
-                navigationMode={activeTool === 'pan' ? 'pan' : enterpriseNavigationMode}
-                rebuildToken={enterpriseRebuildTick}
-                useAllSlices={enterpriseUseAllSlices}
-                clipStart={clipBounds.start}
-                clipEnd={clipBounds.end}
-                removeTable={enterpriseRemoveTable}
-                clipX={clipPlaneX}
-                clipY={clipPlaneY}
-                clipZ={clipPlaneZ}
-                qualityTier="balanced"
-                scalarShift={enterpriseScalarShift}
-                opacityGain={enterpriseOpacityGain}
-                vesselBoost={enterpriseVesselBoost}
-                boneTame={enterpriseBoneTame}
-              />
+              <div
+                className={`volume-viewport-stack volume-viewport-shell ${
+                  enterpriseNavigationMode === 'pan' ? 'nav-pan' : 'nav-rotate'
+                }`}
+                ref={volumeStackRef}
+              >
+                <div className="volume-vtk-host">
+                  <EnterpriseVolume3DViewport
+                    ref={enterpriseVolRef}
+                    activeSeries={activeSeries}
+                    nativeSeries={nativeSeries}
+                    presetId={enterprisePresetId}
+                    navigationMode={enterpriseNavigationMode}
+                    rebuildToken={enterpriseRebuildTick}
+                    useAllSlices={enterpriseUseAllSlices}
+                    clipStart={clipBounds.start}
+                    clipEnd={clipBounds.end}
+                    removeTable={enterpriseRemoveTable}
+                    clipX={clipPlaneX}
+                    clipY={clipPlaneY}
+                    clipZ={clipPlaneZ}
+                    qualityTier="high"
+                    scalarShift={enterpriseScalarShift}
+                    opacityGain={enterpriseOpacityGain}
+                    vesselBoost={enterpriseVesselBoost}
+                    boneTame={enterpriseBoneTame}
+                  />
+                  {lassoCutBusy ? (
+                    <div className="volume-lasso-busy" role="status" aria-live="polite">
+                      Вырезание объёма по контуру…
+                    </div>
+                  ) : null}
+                  <canvas
+                    ref={lasso3dCanvasRef}
+                    className={
+                      activeTool === 'viewLasso'
+                        ? 'volume-lasso-overlay volume-lasso-overlay--interactive'
+                        : 'volume-lasso-overlay'
+                    }
+                    aria-hidden
+                    onMouseDown={handleVolumeLassoPointerDown}
+                    onMouseMove={handleVolumeLassoPointerMove}
+                    onMouseUp={handleVolumeLassoPointerUp}
+                    onMouseLeave={handleVolumeLassoPointerLeave}
+                    onContextMenu={handleVolumeLassoContextMenu}
+                  />
+                </div>
+                <div className="view-cube-wrap">
+                  <ViewCubeSvg
+                    activeView={enterpriseOrientFace}
+                    onFaceSelect={(face) => onEnterpriseViewCubeFace(face)}
+                  />
+                </div>
+              </div>
             )}
           </div>
         </div>
@@ -3634,15 +4023,16 @@ export function DicomViewport({
                   <button
                     type="button"
                     className={
-                      enterpriseNavigationMode === 'rotate'
+                      enterpriseNavigationMode === 'rotate' && activeTool !== 'viewLasso'
                         ? 'vertical-tool icon-only active'
                         : 'vertical-tool icon-only'
                     }
                     title="Вращение 3D"
                     aria-label="Вращение 3D"
-                    aria-pressed={enterpriseNavigationMode === 'rotate'}
+                    aria-pressed={enterpriseNavigationMode === 'rotate' && activeTool !== 'viewLasso'}
                     onClick={() => {
                       setEnterpriseNavigationMode('rotate')
+                      setActiveTool((t) => (t === 'viewLasso' ? 'windowLevel' : t))
                     }}
                   >
                     <IconCTA3D className="toolbar-svg" />
@@ -3650,18 +4040,31 @@ export function DicomViewport({
                   <button
                     type="button"
                     className={
-                      enterpriseNavigationMode === 'pan'
+                      enterpriseNavigationMode === 'pan' && activeTool !== 'viewLasso'
                         ? 'vertical-tool icon-only active'
                         : 'vertical-tool icon-only'
                     }
                     title="Рука (перемещение) · также Space + ЛКМ"
                     aria-label="Рука (перемещение)"
-                    aria-pressed={enterpriseNavigationMode === 'pan'}
+                    aria-pressed={enterpriseNavigationMode === 'pan' && activeTool !== 'viewLasso'}
                     onClick={() => {
                       setEnterpriseNavigationMode('pan')
+                      setActiveTool((t) => (t === 'viewLasso' ? 'windowLevel' : t))
                     }}
                   >
                     <IconPan className="toolbar-svg" />
+                  </button>
+                  <button
+                    type="button"
+                    className={
+                      activeTool === 'viewLasso' ? 'vertical-tool icon-only active' : 'vertical-tool icon-only'
+                    }
+                    title="Лассо 3D · клавиша 8"
+                    aria-label="Лассо 3D"
+                    aria-pressed={activeTool === 'viewLasso'}
+                    onClick={() => setActiveTool('viewLasso')}
+                  >
+                    <IconViewLasso className="toolbar-svg" />
                   </button>
                   <button
                     type="button"
@@ -3727,15 +4130,16 @@ export function DicomViewport({
                 <button
                   type="button"
                   className={
-                    enterpriseNavigationMode === 'rotate'
+                    enterpriseNavigationMode === 'rotate' && activeTool !== 'viewLasso'
                       ? 'vertical-tool icon-only active'
                       : 'vertical-tool icon-only'
                   }
                   title="Вращение 3D"
                   aria-label="Вращение 3D"
-                  aria-pressed={enterpriseNavigationMode === 'rotate'}
+                  aria-pressed={enterpriseNavigationMode === 'rotate' && activeTool !== 'viewLasso'}
                   onClick={() => {
                     setEnterpriseNavigationMode('rotate')
+                    setActiveTool((t) => (t === 'viewLasso' ? 'windowLevel' : t))
                   }}
                 >
                   <IconCTA3D className="toolbar-svg" />
@@ -3743,18 +4147,31 @@ export function DicomViewport({
                 <button
                   type="button"
                   className={
-                    enterpriseNavigationMode === 'pan'
+                    enterpriseNavigationMode === 'pan' && activeTool !== 'viewLasso'
                       ? 'vertical-tool icon-only active'
                       : 'vertical-tool icon-only'
                   }
                   title="Рука (перемещение) · также Space + ЛКМ"
                   aria-label="Рука (перемещение)"
-                  aria-pressed={enterpriseNavigationMode === 'pan'}
+                  aria-pressed={enterpriseNavigationMode === 'pan' && activeTool !== 'viewLasso'}
                   onClick={() => {
                     setEnterpriseNavigationMode('pan')
+                    setActiveTool((t) => (t === 'viewLasso' ? 'windowLevel' : t))
                   }}
                 >
                   <IconPan className="toolbar-svg" />
+                </button>
+                <button
+                  type="button"
+                  className={
+                    activeTool === 'viewLasso' ? 'vertical-tool icon-only active' : 'vertical-tool icon-only'
+                  }
+                  title="Лассо 3D · клавиша 8"
+                  aria-label="Лассо 3D"
+                  aria-pressed={activeTool === 'viewLasso'}
+                  onClick={() => setActiveTool('viewLasso')}
+                >
+                  <IconViewLasso className="toolbar-svg" />
                 </button>
                 <button
                   type="button"
@@ -3835,6 +4252,20 @@ export function DicomViewport({
                     </option>
                   ))}
                 </select>
+
+                <div className="toolbar-section" style={{ padding: '6px 10px' }}>
+                  <label
+                    className="inline-checkbox"
+                    title="Жёлтые линии привязки между аксиальной, корональной и сагиттальной плоскостями"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={showMprCrosslines}
+                      onChange={(e) => setShowMprCrosslines(e.target.checked)}
+                    />
+                    <span>Линии MPR</span>
+                  </label>
+                </div>
               </>
             ) : null}
 
@@ -3969,9 +4400,12 @@ export function DicomViewport({
 
                 <div className="toolbar-section tool-acc-body">
                   <div className="inspector-group">
-                    <div className="inspector-row" title="Enterprise пресеты: строятся на сервере и загружаются как 3D-сетка (GLB)">
+                    <div
+                      className="inspector-row"
+                      title="VRT vtk: ангио — кость скрывается ползунком «Скрытие кости»; Кости/Лёгкие — отдельные цветовые шкалы."
+                    >
                       <span className="inspector-label">
-                        <span className="inspector-label-text">Пресет</span>
+                        <span className="inspector-label-text">Пресет 3D</span>
                       </span>
                       <span className="inspector-control">
                         <div className="segmented-control">
@@ -3979,35 +4413,80 @@ export function DicomViewport({
                             type="button"
                             className={enterprisePresetId === 'aorta' ? 'segment-button active' : 'segment-button'}
                             onClick={() => setEnterprisePresetId('aorta')}
-                            title="Аорта"
+                            title="Ангио CTA: аорта и ветви, кость по умолчанию скрыта (ползунок справа)"
                           >
-                            Aorta
+                            Аорта
                           </button>
                           <button
                             type="button"
                             className={enterprisePresetId === 'vessels_general' ? 'segment-button active' : 'segment-button'}
                             onClick={() => setEnterprisePresetId('vessels_general')}
-                            title="Сосуды"
+                            title="Сосуды (артерии/вены): золото и холодный просвет, кость скрывается ползунком"
                           >
-                            Vessels
+                            Сосуды
                           </button>
                           <button
                             type="button"
                             className={enterprisePresetId === 'bones' ? 'segment-button active' : 'segment-button'}
                             onClick={() => setEnterprisePresetId('bones')}
-                            title="Кости"
+                            title="Костный VRT: слоновая кость, мягкие ткани приглушены"
                           >
-                            Bones
+                            Кости
                           </button>
                           <button
                             type="button"
                             className={enterprisePresetId === 'lungs' ? 'segment-button active' : 'segment-button'}
                             onClick={() => setEnterprisePresetId('lungs')}
-                            title="Лёгкие"
+                            title="Лёгочный режим: воздух циан, тело полупрозрачное"
                           >
-                            Lungs
+                            Лёгкие
                           </button>
                         </div>
+                      </span>
+                    </div>
+
+                    <div
+                      className="inspector-row"
+                      title="Инструмент «Лассо 3D» — кнопка с иконкой лассо на панели слева от объёма или клавиша 8."
+                    >
+                      <span className="inspector-label">
+                        <span className="inspector-label-text">Лассо 3D</span>
+                      </span>
+                      <span className="inspector-control inspector-control-slider-num">
+                        <label className="inline-checkbox">
+                          <input
+                            type="checkbox"
+                            checked={enterpriseLassoBoneOnly}
+                            onChange={(e) => setEnterpriseLassoBoneOnly(e.target.checked)}
+                          />
+                          <span title="Срабатывает только после обводки лассо, не меняет общий вид объёма">
+                            Только кость (лассо)
+                          </span>
+                        </label>
+                        <input
+                          className="inspector-num-input"
+                          type="number"
+                          min={ENTERPRISE_LASSO_BONE_HU_MIN}
+                          max={ENTERPRISE_LASSO_BONE_HU_MAX}
+                          step={10}
+                          disabled={!enterpriseLassoBoneOnly}
+                          value={enterpriseLassoBoneHuMin}
+                          onChange={(e) => {
+                            const v = Number(e.target.value)
+                            if (!Number.isFinite(v)) return
+                            setEnterpriseLassoBoneHuMin(
+                              Math.round(clamp(v, ENTERPRISE_LASSO_BONE_HU_MIN, ENTERPRISE_LASSO_BONE_HU_MAX)),
+                            )
+                          }}
+                          aria-label="Минимальный HU для удаления в лассо"
+                        />
+                        <span className="inspector-value inspector-value-suffix">HU</span>
+                      </span>
+                      <span className="inspector-param-hint">
+                        Важно: эти настройки не подавляют кость на всём 3D — только когда вы обводите контур инструментом «Лассо
+                        3D». Пресет «Аорта» и ползунок «Скрытие кости» задают общий вид; лассо — точечная вырезка внутри контура.
+                        В режиме «только кость» в лассо обнуляются воксели с HU ≥ порога (обычно 280–480; макс.{' '}
+                        {ENTERPRISE_LASSO_BONE_HU_MAX}). Выкл. — удаляется всё внутри контура.
                       </span>
                     </div>
 
@@ -4020,12 +4499,13 @@ export function DicomViewport({
                           <button
                             type="button"
                             className={
-                              enterpriseNavigationMode === 'rotate'
+                              enterpriseNavigationMode === 'rotate' && activeTool !== 'viewLasso'
                                 ? 'segment-button active'
                                 : 'segment-button'
                             }
                             onClick={() => {
                               setEnterpriseNavigationMode('rotate')
+                              setActiveTool((t) => (t === 'viewLasso' ? 'windowLevel' : t))
                             }}
                             title="Вращение"
                           >
@@ -4034,12 +4514,13 @@ export function DicomViewport({
                           <button
                             type="button"
                             className={
-                              enterpriseNavigationMode === 'pan'
+                              enterpriseNavigationMode === 'pan' && activeTool !== 'viewLasso'
                                 ? 'segment-button active'
                                 : 'segment-button'
                             }
                             onClick={() => {
                               setEnterpriseNavigationMode('pan')
+                              setActiveTool((t) => (t === 'viewLasso' ? 'windowLevel' : t))
                             }}
                             title="Перемещение"
                           >
@@ -4065,7 +4546,10 @@ export function DicomViewport({
                       </span>
                     </div>
 
-                    <div className="inspector-row" title="Native (NAC) серия нужна для DSA (contrast - native) в Aorta/Vessels">
+                    <div
+                      className="inspector-row"
+                      title="Отдельная нативная серия даёт DSA (контраст − натив) для Aorta/Vessels. Если только контрастная КТ — оставьте «не выбрана»: 3D строится по HU контраста без вычитания."
+                    >
                       <span className="inspector-label">
                         <span className="inspector-label-text">Native (NAC)</span>
                       </span>
@@ -4087,76 +4571,198 @@ export function DicomViewport({
                       </span>
                     </div>
 
-                    <div className="inspector-row" title="Сдвиг шкалы HU для transfer function">
+                    <div className="inspector-row">
+                      <span className="inspector-param-hint">
+                        «Не выбрана» здесь — нативная серия для DSA (вычитание натива). Пресет 3D задаётся
+                        кнопками Аорта / Сосуды / Кости / Лёгкие выше.
+                      </span>
+                    </div>
+
+                    <div
+                      className="inspector-row"
+                      title="Сдвиг опорных точек TF по HU. Ползунок или ввод числа (Enter)."
+                    >
                       <span className="inspector-label">
                         <span className="inspector-label-text">Сдвиг HU</span>
                       </span>
-                      <span className="inspector-control">
+                      <span className="inspector-control inspector-control-slider-num">
                         <input
-                          className="inspector-mini-range"
+                          className="inspector-mini-range inspector-range-grow"
                           type="range"
-                          min={-250}
-                          max={250}
-                          value={enterpriseScalarShift}
+                          min={ENTERPRISE_HU_SHIFT_MIN}
+                          max={ENTERPRISE_HU_SHIFT_MAX}
+                          step={1}
+                          value={clamp(
+                            enterpriseScalarShift,
+                            ENTERPRISE_HU_SHIFT_MIN,
+                            ENTERPRISE_HU_SHIFT_MAX,
+                          )}
                           onChange={(e) => setEnterpriseScalarShift(Number(e.target.value))}
                         />
-                        <span className="inspector-value">
-                          {enterpriseScalarShift > 0 ? '+' : ''}
-                          {enterpriseScalarShift}
-                        </span>
-                      </span>
-                    </div>
-
-                    <div className="inspector-row" title="Общая прозрачность/яркость объёмного рендера">
-                      <span className="inspector-label">
-                        <span className="inspector-label-text">Opacity</span>
-                      </span>
-                      <span className="inspector-control">
                         <input
-                          className="inspector-mini-range"
-                          type="range"
-                          min={40}
-                          max={220}
-                          value={Math.round(enterpriseOpacityGain * 100)}
-                          onChange={(e) => setEnterpriseOpacityGain(Number(e.target.value) / 100)}
+                          className="inspector-num-input"
+                          type="number"
+                          min={ENTERPRISE_HU_SHIFT_MIN}
+                          max={ENTERPRISE_HU_SHIFT_MAX}
+                          step={1}
+                          value={enterpriseScalarShift}
+                          onChange={(e) => {
+                            const v = Number(e.target.value)
+                            if (!Number.isFinite(v)) return
+                            setEnterpriseScalarShift(
+                              Math.round(clamp(v, ENTERPRISE_HU_SHIFT_MIN, ENTERPRISE_HU_SHIFT_MAX)),
+                            )
+                          }}
+                          aria-label="Сдвиг HU, вручную"
                         />
-                        <span className="inspector-value">{Math.round(enterpriseOpacityGain * 100)}%</span>
+                      </span>
+                      <span className="inspector-param-hint">
+                        Смещение цвета и непрозрачности по шкале HU (−250…250), без пересчёта тома.
                       </span>
                     </div>
 
-                    <div className="inspector-row" title="Усиление сосудистого диапазона (контраст 150–450 HU)">
+                    <div
+                      className="inspector-row"
+                      title="Общая непрозрачность DVR. Диапазон 25–260%. Ползунок или ввод числа."
+                    >
                       <span className="inspector-label">
-                        <span className="inspector-label-text">Vessel boost</span>
+                        <span className="inspector-label-text">Непрозрачность</span>
                       </span>
-                      <span className="inspector-control">
+                      <span className="inspector-control inspector-control-slider-num">
                         <input
-                          className="inspector-mini-range"
+                          className="inspector-mini-range inspector-range-grow"
+                          type="range"
+                          min={ENTERPRISE_OPACITY_PCT_MIN}
+                          max={ENTERPRISE_OPACITY_PCT_MAX}
+                          step={1}
+                          value={clamp(
+                            Math.round(enterpriseOpacityGain * 100),
+                            ENTERPRISE_OPACITY_PCT_MIN,
+                            ENTERPRISE_OPACITY_PCT_MAX,
+                          )}
+                          onChange={(e) =>
+                            setEnterpriseOpacityGain(Number(e.target.value) / 100)
+                          }
+                        />
+                        <input
+                          className="inspector-num-input"
+                          type="number"
+                          min={ENTERPRISE_OPACITY_PCT_MIN}
+                          max={ENTERPRISE_OPACITY_PCT_MAX}
+                          step={1}
+                          value={Math.round(enterpriseOpacityGain * 100)}
+                          onChange={(e) => {
+                            const v = Number(e.target.value)
+                            if (!Number.isFinite(v)) return
+                            const p = Math.round(
+                              clamp(v, ENTERPRISE_OPACITY_PCT_MIN, ENTERPRISE_OPACITY_PCT_MAX),
+                            )
+                            setEnterpriseOpacityGain(p / 100)
+                          }}
+                          aria-label="Непрозрачность в процентах"
+                        />
+                        <span className="inspector-value inspector-value-suffix">%</span>
+                      </span>
+                      <span className="inspector-param-hint">
+                        Общий множитель α по объёму (DVR): «яркость» наполнения, 25–260%.
+                      </span>
+                    </div>
+
+                    <div
+                      className="inspector-row"
+                      title="Усиление сосудистого диапазона (йод). 0–100%, можно ввести число."
+                    >
+                      <span className="inspector-label">
+                        <span className="inspector-label-text">Сосуды</span>
+                      </span>
+                      <span className="inspector-control inspector-control-slider-num">
+                        <input
+                          className="inspector-mini-range inspector-range-grow"
                           type="range"
                           min={0}
                           max={100}
+                          step={1}
                           value={Math.round(enterpriseVesselBoost * 100)}
                           onChange={(e) => setEnterpriseVesselBoost(Number(e.target.value) / 100)}
                         />
-                        <span className="inspector-value">{Math.round(enterpriseVesselBoost * 100)}%</span>
+                        <input
+                          className="inspector-num-input"
+                          type="number"
+                          min={0}
+                          max={100}
+                          step={1}
+                          value={Math.round(enterpriseVesselBoost * 100)}
+                          onChange={(e) => {
+                            const v = Number(e.target.value)
+                            if (!Number.isFinite(v)) return
+                            setEnterpriseVesselBoost(clamp(Math.round(v), 0, 100) / 100)
+                          }}
+                          aria-label="Vessel boost в процентах"
+                        />
+                        <span className="inspector-value inspector-value-suffix">%</span>
+                      </span>
+                      <span className="inspector-param-hint">
+                        Для чёткого просвета на CTA держите 70–100%. При ~0% сосуды бледнеют.
                       </span>
                     </div>
 
-                    <div className="inspector-row" title="Подавление плотной кости (550+ HU) в CTA">
+                    <div
+                      className="inspector-row"
+                      title="Ангио (Аорта/Сосуды): 100% — максимально скрыть кортикальную кость; 0% — слабый ориентир по кости."
+                    >
                       <span className="inspector-label">
-                        <span className="inspector-label-text">Bone tame</span>
+                        <span className="inspector-label-text">Скрытие кости</span>
                       </span>
-                      <span className="inspector-control">
+                      <span className="inspector-control inspector-control-slider-num">
                         <input
-                          className="inspector-mini-range"
+                          className="inspector-mini-range inspector-range-grow"
                           type="range"
                           min={0}
                           max={100}
+                          step={1}
                           value={Math.round(enterpriseBoneTame * 100)}
                           onChange={(e) => setEnterpriseBoneTame(Number(e.target.value) / 100)}
                         />
-                        <span className="inspector-value">{Math.round(enterpriseBoneTame * 100)}%</span>
+                        <input
+                          className="inspector-num-input"
+                          type="number"
+                          min={0}
+                          max={100}
+                          step={1}
+                          value={Math.round(enterpriseBoneTame * 100)}
+                          onChange={(e) => {
+                            const v = Number(e.target.value)
+                            if (!Number.isFinite(v)) return
+                            setEnterpriseBoneTame(clamp(Math.round(v), 0, 100) / 100)
+                          }}
+                          aria-label="Bone tame в процентах"
+                        />
+                        <span className="inspector-value inspector-value-suffix">%</span>
+                      </span>
+                      <span className="inspector-param-hint">
+                        100%: максимально убрать рёбра/таз (как «чистое» CTA). 0%: кость остаётся в кадре.
+                        Просвет ~150–400 HU и выше кортикали подавляются по кривой DVR.
                       </span>
                     </div>
+
+                    {(enterprisePresetId === 'aorta' || enterprisePresetId === 'vessels_general') &&
+                    enterpriseBoneTame < 0.35 ? (
+                      <div className="inspector-row">
+                        <span className="inspector-param-hint inspector-bone-warn">
+                          Скрытие кости сейчас низкое — кость остаётся видимой. Для максимального подавления
+                          поставьте 100%.
+                        </span>
+                      </div>
+                    ) : null}
+                    {(enterprisePresetId === 'aorta' || enterprisePresetId === 'vessels_general') &&
+                    enterpriseBoneTame >= 0.85 ? (
+                      <div className="inspector-row">
+                        <span className="inspector-param-hint">
+                          Если кость всё ещё мешает: рёбра и йод могут совпадать по HU; выберите нативную
+                          серию (DSA) для лучшего разделения или другой ракурс.
+                        </span>
+                      </div>
+                    ) : null}
 
                     <div className="inspector-row" title="Убрать стол/ложемент при сборке 3D тома">
                       <span className="inspector-label">
@@ -4239,7 +4845,7 @@ export function DicomViewport({
             </>
           ) : (
             <div className="toolbar-section toolbar-section-icons">
-              {TOOL_ITEMS.map((item, ti) => (
+              {TOOL_ITEMS_2D.map((item, ti) => (
                 <button
                   key={item.id}
                   className={activeTool === item.id ? 'vertical-tool icon-only active' : 'vertical-tool icon-only'}
@@ -4251,50 +4857,6 @@ export function DicomViewport({
                   {toolIcon(item.id)}
                 </button>
               ))}
-              <button
-                type="button"
-                className={interpolation2d ? 'vertical-tool icon-only active' : 'vertical-tool icon-only'}
-                title={
-                  workspaceMode === 'diagnostic'
-                    ? 'В 2D диагностике сглаживание отключено, чтобы не «мылить».'
-                    : 'Интерполяция 2D при масштабе: вкл — сглаживание (билинейная), выкл — ближайший сосед (чёткие пиксели)'
-                }
-                aria-label="Интерполяция 2D при масштабе"
-                aria-pressed={interpolation2d}
-                disabled={workspaceMode === 'diagnostic'}
-                onClick={() => {
-                  if (workspaceMode === 'diagnostic') return
-                  setInterpolation2d((v) => {
-                    const next = !v
-                    saveWorkstationPrefs({ interpolation2d: next })
-                    return next
-                  })
-                }}
-              >
-                <IconInterp2d className="toolbar-svg" />
-              </button>
-              <button
-                type="button"
-                className={superCrisp2d ? 'vertical-tool icon-only active' : 'vertical-tool icon-only'}
-                title={
-                  workspaceMode === 'diagnostic'
-                    ? 'Супер-чётко: привязка 2D-рендера к целым пикселям экрана (без дробных смещений/размеров).'
-                    : 'Супер-чётко работает только в диагностическом 2D.'
-                }
-                aria-label="Супер-чёткий 2D"
-                aria-pressed={superCrisp2d}
-                disabled={workspaceMode !== 'diagnostic'}
-                onClick={() => {
-                  if (workspaceMode !== 'diagnostic') return
-                  setSuperCrisp2d((v) => {
-                    const next = !v
-                    saveWorkstationPrefs({ superCrisp2d: next })
-                    return next
-                  })
-                }}
-              >
-                <span style={{ fontWeight: 800, fontSize: 12, letterSpacing: 0.2 }}>HD</span>
-              </button>
               <button
                 type="button"
                 className={
@@ -4716,3 +5278,6 @@ export function DicomViewport({
     </section>
   )
 }
+
+export { DicomViewport }
+export default DicomViewport

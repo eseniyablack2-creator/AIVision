@@ -3,6 +3,7 @@ import { Canvas, useThree } from '@react-three/fiber'
 import { useEffect, useRef, useState } from 'react'
 import * as THREE from 'three'
 import type { DicomSeries } from '../lib/dicom'
+import { getSegmentationApiBase } from '../lib/inferenceApiBase'
 
 export type Backend3DPresetId = 'aorta' | 'vessels_general' | 'bones' | 'lungs'
 export type VolumeNavigationMode = 'rotate' | 'pan'
@@ -20,9 +21,7 @@ const MAX_PREVIEW_SLICES = 420
 const REQUEST_TIMEOUT_MS = 120_000
 
 function getApiBase(): string {
-  const raw = import.meta.env.VITE_PATHOLOGY_API_URL
-  if (typeof raw === 'string' && raw.trim().length > 0) return raw.trim().replace(/\/$/, '')
-  return 'http://127.0.0.1:8000'
+  return getSegmentationApiBase()
 }
 
 function pickPreviewStride(total: number): number {

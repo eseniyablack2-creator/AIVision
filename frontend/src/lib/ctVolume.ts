@@ -85,15 +85,14 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n))
 }
 
-function sanitizeTableBandRows(dimY: number, tableCutRowsRaw: number): number {
-  // Безопасный режим: авто-обрезка стола не должна убирать анатомию.
-  // Если алгоритм оценил слишком большую полосу, считаем это ложным срабатыванием.
-  // Реальные КТ часто имеют широкий "ложемент" и полосы ремней, поэтому увеличиваем допуск.
+/** Только нижняя полоса: совпадает с ctVolumeBuild.worker; верх/бока не трогаем — там частые ложные срабатывания на ткани пациента. */
+function sanitizeTableBandRows(dimY: number, bandRaw: number): number {
+  if (bandRaw <= 0) return 0
   const hardCap = Math.max(0, Math.floor(dimY * 0.22))
-  if (tableCutRowsRaw > Math.floor(dimY * 0.45)) {
+  if (bandRaw > Math.floor(dimY * 0.45)) {
     return 0
   }
-  return clamp(tableCutRowsRaw, 0, hardCap)
+  return clamp(bandRaw, 0, hardCap)
 }
 
 async function loadSlice(file: File): Promise<Slice> {
@@ -213,15 +212,12 @@ export async function buildCtVolumeFromSeries(
     }
   }
 
-  // В 3D «убрать стол» должно быть консервативным: лучше оставить чуть стола,
-  // чем срезать тело. Поэтому:
-  // - низ стола убираем маской по строкам (tableCutRows)
-  // - бок/верх обрезаем только в безопасных пределах
-  const tableCutRowsRaw = removeTable ? estimateTableCutRowsForSlices(clipped) : 0
-  const tableCutRows = sanitizeTableBandRows(dimY, tableCutRowsRaw)
+  // «Убрать стол»: только нижняя аксиальная полоса (ложе). Боковые/верхние маски давали ложные совпадения
+  // с мягкими тканями и отрезали переднюю/боковую анатомию — см. worker ctVolumeBuild.
+  const tableCutRows = removeTable
+    ? sanitizeTableBandRows(dimY, estimateTableCutRowsForSlices(clipped))
+    : 0
 
-  // В 3D-режиме геометрический кроп по бокам/сверху чаще даёт риск потери анатомии,
-  // поэтому оставляем только маскирование "пола" (tableCutRows) без срезания поля обзора.
   const left = 0
   const right = 0
   const top = 0
@@ -273,11 +269,11 @@ export async function buildCtVolumeFromSeries(
     for (let y = 0; y < ny; y += 1) {
       const fy = y + uy0
       const sy = tc.top + fy
-      const isTableBand = removeTable && tableCutRows > 0 && sy >= dimY - tableCutRows
+      const isTableBottom = removeTable && tableCutRows > 0 && sy >= dimY - tableCutRows
       for (let x = 0; x < nx; x += 1) {
         const fx = x + ux0
         const sx = tc.left + fx
-        const v = isTableBand ? -1024 : slice.huPixels[sy * dimX + sx]
+        const v = isTableBottom ? -1024 : slice.huPixels[sy * dimX + sx]
         cropped[x + y * nx + z * nx * ny] = v
       }
     }

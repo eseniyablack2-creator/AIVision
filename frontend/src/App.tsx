@@ -6,9 +6,8 @@ import {
   DicomViewport,
   type ComparisonWorkbenchProbeState,
   type DicomComparisonSync,
-} from './components/DicomViewport'
+} from './components/DicomViewport.tsx'
 import { ComparisonMetadataBar } from './components/ComparisonMetadataBar'
-import { ComparisonPatientMismatchModal } from './components/ComparisonPatientMismatchModal'
 import { SimilarCasesModal } from './components/SimilarCasesModal'
 import type { SimilarCasesFocusContext } from './lib/similarCasesMock'
 import { loadWorkstationPrefs } from './lib/sessionPrefs'
@@ -19,7 +18,10 @@ import {
   buildSeriesWithRejects,
 } from './lib/dicom'
 import type { DicomSeries } from './lib/dicom'
-import { patientIdsMismatch } from './lib/comparisonSeriesMeta'
+import {
+  getExplicitPathologyApiBaseFromEnv,
+  getInferenceHealthCheckCandidates,
+} from './lib/inferenceApiBase'
 
 const features = [
   'Автоматический отбор DICOM-файлов из выбранной папки',
@@ -49,6 +51,7 @@ function initialComparisonWorkbenchProbe(): ComparisonWorkbenchProbeState {
 
 function App() {
   const folderInputRef = useRef<HTMLInputElement | null>(null)
+  const filesOnlyInputRef = useRef<HTMLInputElement | null>(null)
   const comparisonFolderRef = useRef<HTMLInputElement | null>(null)
   const comparisonLeadWorkbenchRef = useRef<ComparisonWorkbenchProbeState>(initialComparisonWorkbenchProbe())
   const [isStudyRailCollapsed, setIsStudyRailCollapsed] = useState(false)
@@ -80,7 +83,8 @@ function App() {
   const [linkedPresetId, setLinkedPresetId] = useState(() => loadWorkstationPrefs().presetId)
   const [similarCasesOpen, setSimilarCasesOpen] = useState(false)
   const [similarCasesFocus, setSimilarCasesFocus] = useState<SimilarCasesFocusContext | null>(null)
-  const [patientMismatchAcknowledgedKey, setPatientMismatchAcknowledgedKey] = useState('')
+  /** Выпадающее меню серии в левой панели (⋯). */
+  const [seriesRowMenuUid, setSeriesRowMenuUid] = useState<string | null>(null)
 
   const totalSize = useMemo(
     () => selectedFiles.reduce((sum, file) => sum + file.size, 0),
@@ -115,34 +119,176 @@ function App() {
     comparisonSeriesList.find((s) => s.seriesInstanceUid === comparisonActiveUid) ?? null
 
   const checkInferenceApi = useCallback(async () => {
-    const raw = import.meta.env.VITE_PATHOLOGY_API_URL
-    const base =
-      typeof raw === 'string' && raw.trim().length > 0
-        ? raw.trim().replace(/\/$/, '')
-        : 'http://127.0.0.1:8000'
+    const candidates = getInferenceHealthCheckCandidates()
+    const primary = candidates[0] ?? ''
+    const explicitPathologyBase = getExplicitPathologyApiBaseFromEnv()
+    const envOverride = explicitPathologyBase != null
 
     setApiStatus('checking')
     setApiStatusText('Проверяем API...')
 
-    try {
+    /** Прямой запрос к inference (CORS у API открыт). Обходит прокси Vite, если он не срабатывает. */
+    const tryDirectLoopbackHealth = async (): Promise<boolean> => {
+      if (envOverride) return false
+      if (typeof window === 'undefined') return false
+      const urls = ['http://127.0.0.1:8787/health', 'http://localhost:8787/health']
+      for (const url of urls) {
+        const controller = new AbortController()
+        const timeout = window.setTimeout(() => controller.abort(), 5000)
+        try {
+          const res = await fetch(url, {
+            method: 'GET',
+            signal: controller.signal,
+            credentials: 'omit',
+            cache: 'no-store',
+            headers: { Accept: 'application/json' },
+          })
+          window.clearTimeout(timeout)
+          if (!res.ok) continue
+          const data = (await res.json().catch(() => null)) as { status?: string } | null
+          if (data?.status === 'ok') {
+            setApiStatus('ok')
+            setApiStatusText('API подключен')
+            return true
+          }
+        } catch {
+          window.clearTimeout(timeout)
+        }
+      }
+      return false
+    }
+
+    if (await tryDirectLoopbackHealth()) return
+
+    /** Запрос к 127.0.0.1:8787 из процесса Vite (Node) — если браузер режет прямой :8787. */
+    const tryViteNodeHealthProbe = async (): Promise<'ok' | 'api_down' | 'skip'> => {
+      if (envOverride) return 'skip'
+      if (typeof window === 'undefined') return 'skip'
+      if (window.location.protocol !== 'http:' && window.location.protocol !== 'https:') return 'skip'
       const controller = new AbortController()
-      const timeout = window.setTimeout(() => controller.abort(), 3500)
-      const res = await fetch(`${base}/health`, {
-        method: 'GET',
-        signal: controller.signal,
-        credentials: 'omit',
-      })
-      window.clearTimeout(timeout)
-      if (!res.ok) {
-        setApiStatus('error')
-        setApiStatusText(`API недоступен (${res.status})`)
+      const timeout = window.setTimeout(() => controller.abort(), 6000)
+      try {
+        const res = await fetch('/__aivision_health_probe', {
+          method: 'GET',
+          signal: controller.signal,
+          credentials: 'omit',
+          cache: 'no-store',
+          headers: { Accept: 'application/json' },
+        })
+        window.clearTimeout(timeout)
+        const data = (await res.json().catch(() => null)) as {
+          status?: string
+          service?: string
+          error?: string
+          code?: string | null
+        } | null
+        // Достаточно status (как у tryDirectLoopbackHealth); service мог отличаться в форках/прокси.
+        if (data?.status === 'ok') {
+          setApiStatus('ok')
+          setApiStatusText('API подключен')
+          return 'ok'
+        }
+        if (data?.status === 'error' && data.service === 'aivision-health-probe') {
+          setApiStatus('error')
+          const detail = [data.error, data.code].filter(Boolean).join(' ')
+          setApiStatusText(
+            `Inference не запущен (порт 8787 с сервера Vite недоступен${detail ? `: ${detail}` : ''}). В папке AIVision выполните npm run dev:full и оставьте окно открытым, пока видите строку «Uvicorn running…».`,
+          )
+          return 'api_down'
+        }
+        return 'skip'
+      } catch {
+        window.clearTimeout(timeout)
+        return 'skip'
+      }
+    }
+
+    const probe = await tryViteNodeHealthProbe()
+    if (probe === 'ok') return
+    if (probe === 'api_down') return
+
+    /** Сначала относительный URL — тот же host:port, что вкладка (устойчиво в Яндекс.Браузере и при localhost/127.0.0.1). */
+    const tryRelativeProxyHealth = async (): Promise<boolean> => {
+      if (envOverride) return false
+      if (typeof window === 'undefined') return false
+      const { protocol } = window.location
+      if (protocol !== 'http:' && protocol !== 'https:') return false
+      const path = `${import.meta.env.BASE_URL}__aivision_inference/health`.replace(/\/{2,}/g, '/')
+      const controller = new AbortController()
+      const timeout = window.setTimeout(() => controller.abort(), 8000)
+      try {
+        const res = await fetch(path, {
+          method: 'GET',
+          signal: controller.signal,
+          credentials: 'omit',
+          cache: 'no-store',
+          headers: { Accept: 'application/json' },
+        })
+        window.clearTimeout(timeout)
+        if (!res.ok) return false
+        const data = (await res.json().catch(() => null)) as { status?: string } | null
+        if (!data || data.status !== 'ok') return false
+        setApiStatus('ok')
+        setApiStatusText('API подключен')
+        return true
+      } catch (e) {
+        window.clearTimeout(timeout)
+        if (import.meta.env.DEV) console.debug('[AIVision] /__aivision_inference/health', e)
+        return false
+      }
+    }
+
+    const tryOneBase = async (base: string): Promise<string | null> => {
+      const controller = new AbortController()
+      const timeout = window.setTimeout(() => controller.abort(), 5000)
+      try {
+        const res = await fetch(`${base.replace(/\/$/, '')}/health`, {
+          method: 'GET',
+          signal: controller.signal,
+          credentials: 'omit',
+          cache: 'no-store',
+          headers: { Accept: 'application/json' },
+        })
+        window.clearTimeout(timeout)
+        if (!res.ok) return null
+        const data = (await res.json().catch(() => null)) as { status?: string } | null
+        if (!data || data.status !== 'ok') return null
+        return base
+      } catch {
+        window.clearTimeout(timeout)
+        return null
+      }
+    }
+
+    /** Несколько URL сразу: не ждём по очереди таймаут LAN/127.0.0.1; повторы — если API ещё поднимается. */
+    const maxRounds = 10
+    const pauseMs = 450
+    for (let round = 0; round < maxRounds; round += 1) {
+      if (await tryRelativeProxyHealth()) return
+      const outcomes = await Promise.all(candidates.map((b) => tryOneBase(b)))
+      const okBase = outcomes.find((x) => x != null) ?? null
+      if (okBase) {
+        setApiStatus('ok')
+        setApiStatusText(okBase === primary ? 'API подключен' : `API подключен (${okBase})`)
         return
       }
-      setApiStatus('ok')
-      setApiStatusText('API подключен')
-    } catch {
-      setApiStatus('error')
-      setApiStatusText('API недоступен')
+      if (round < maxRounds - 1) {
+        await new Promise<void>((r) => {
+          window.setTimeout(r, pauseMs)
+        })
+      }
+    }
+
+    setApiStatus('error')
+    if (envOverride) {
+      const hint = explicitPathologyBase ?? String(import.meta.env.VITE_PATHOLOGY_API_URL).trim()
+      setApiStatusText(
+        `Не удалось достучаться до inference по VITE_PATHOLOGY_API_URL (${hint}). Убедитесь, что там верный базовый URL и GET …/health возвращает JSON с "status":"ok". Если хотите стандартный локальный режим (:8787 + прокси Vite), уберите переменную из .env и перезапустите dev.`,
+      )
+    } else {
+      setApiStatusText(
+        'Сайт не достучался до API (ни прямой :8787, ни прокси Vite). Проверьте: окно с npm run dev:full открыто и в нём есть «Uvicorn running»; в новой вкладке открывается http://127.0.0.1:8787/docs ; адрес страницы AIVision совпадает со строкой «Local:»; Ctrl+Shift+R.',
+      )
     }
   }, [])
 
@@ -150,18 +296,6 @@ function App() {
     comparisonPaneOpen && activeSeries && comparisonSeries
       ? `${activeSeries.seriesInstanceUid}\u00a0${comparisonSeries.seriesInstanceUid}`
       : null
-
-  const showPatientMismatchModal = Boolean(
-    comparisonSessionKey &&
-      activeSeries &&
-      comparisonSeries &&
-      patientIdsMismatch(activeSeries, comparisonSeries) &&
-      patientMismatchAcknowledgedKey !== comparisonSessionKey,
-  )
-
-  useEffect(() => {
-    if (!comparisonPaneOpen) setPatientMismatchAcknowledgedKey('')
-  }, [comparisonPaneOpen])
 
   useEffect(() => {
     void checkInferenceApi()
@@ -240,6 +374,65 @@ function App() {
     comparisonSeries?.seriesInstanceUid,
   ])
 
+  useEffect(() => {
+    if (!seriesRowMenuUid) return
+    const onDocPointer = (e: PointerEvent) => {
+      const el = e.target as Element | null
+      if (el?.closest('[data-series-menu-root]')) return
+      setSeriesRowMenuUid(null)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSeriesRowMenuUid(null)
+    }
+    document.addEventListener('pointerdown', onDocPointer, true)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('pointerdown', onDocPointer, true)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [seriesRowMenuUid])
+
+  useEffect(() => {
+    if (isStudyRailCollapsed) setSeriesRowMenuUid(null)
+  }, [isStudyRailCollapsed])
+
+  /** Убрать серию из рабочего списка (из памяти; файлы на диске не удаляются). */
+  const removeStudySeries = useCallback(
+    (seriesInstanceUid: string) => {
+      setSeriesRowMenuUid(null)
+      const victim = seriesList.find((s) => s.seriesInstanceUid === seriesInstanceUid)
+      if (!victim) return
+
+      const next = seriesList.filter((s) => s.seriesInstanceUid !== seriesInstanceUid)
+      const victimFiles = new Set(victim.files.map((p) => p.file))
+      setSelectedFiles((files) => files.filter((f) => !victimFiles.has(f)))
+      setSeriesList(next)
+
+      if (next.length === 0) {
+        clearCornerstoneFileManager()
+        setActiveSeriesUid('')
+        setNativeSeriesUid('')
+        return
+      }
+
+      const removedActive = activeSeriesUid === seriesInstanceUid
+      const newActive = removedActive ? next[0]!.seriesInstanceUid : activeSeriesUid
+      if (removedActive) {
+        setActiveSeriesUid(newActive)
+      }
+
+      const nativeInvalid =
+        nativeSeriesUid === seriesInstanceUid ||
+        !next.some((s) => s.seriesInstanceUid === nativeSeriesUid)
+      const nativeClashesActive = nativeSeriesUid === newActive
+      if (nativeInvalid || (removedActive && nativeClashesActive)) {
+        const pick = next.find((s) => s.seriesInstanceUid !== newActive) ?? next[0]!
+        setNativeSeriesUid(pick.seriesInstanceUid)
+      }
+    },
+    [seriesList, activeSeriesUid, nativeSeriesUid],
+  )
+
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? [])
 
@@ -265,19 +458,27 @@ function App() {
 
     try {
       clearCornerstoneFileManager()
-      const { accepted, rejected, seriesList: groupedSeries } = await buildSeriesWithRejects(files)
+      const { accepted, rejected, seriesList: groupedSeries } = await buildSeriesWithRejects(files, {
+        onProgress: (done, total) => {
+          setScanMessage(`Разбор DICOM: ${done} / ${total} файлов…`)
+        },
+      })
 
       setSelectedFiles(accepted)
       setRejectedFiles(rejected)
       setSeriesList(groupedSeries)
-      setActiveSeriesUid(groupedSeries[0]?.seriesInstanceUid ?? '')
-      // Best-effort auto-pick a likely native (NAC) series for DSA.
+      const firstUid = groupedSeries[0]?.seriesInstanceUid ?? ''
+      setActiveSeriesUid(firstUid)
+      // NAC для DSA: только если явно по описанию и не та же серия, что активная (иначе DSA по одной КТ обнуляет 3D).
       if (groupedSeries.length > 0) {
         const byHint = groupedSeries.find((s) =>
           /nac|native|non[-\s]?contrast|без\s*контраста/i.test(s.seriesDescription || ''),
         )
-        const pick = byHint ?? groupedSeries[0]
-        setNativeSeriesUid(pick?.seriesInstanceUid ?? '')
+        if (byHint && byHint.seriesInstanceUid !== firstUid) {
+          setNativeSeriesUid(byHint.seriesInstanceUid)
+        } else {
+          setNativeSeriesUid('')
+        }
       }
       setScanStatus('done')
 
@@ -290,13 +491,22 @@ function App() {
           'Папка выбрана, но DICOM-файлы не распознаны. Возможно, у файлов нестандартный формат или вложенная структура.',
         )
       }
-    } catch {
+    } catch (err) {
+      console.error('DICOM import failed', err)
       setSelectedFiles([])
       setRejectedFiles([])
       setSeriesList([])
       setActiveSeriesUid('')
       setScanStatus('error')
-      setScanMessage('Не удалось обработать папку. Попробуйте выбрать ее еще раз.')
+      const detail = err instanceof Error ? err.message : String(err)
+      setScanMessage(
+        detail
+          ? `Ошибка импорта: ${detail}. Если файлов очень много — закройте другие вкладки и повторите.`
+          : 'Не удалось обработать выбранные файлы. Попробуйте снова или выберите меньше файлов за раз.',
+      )
+    } finally {
+      const t = event.target
+      if (t && 'value' in t) (t as HTMLInputElement).value = ''
     }
   }
 
@@ -325,6 +535,7 @@ function App() {
               className="nav-action-button"
               onClick={() => folderInputRef.current?.click()}
               type="button"
+              title="Выбрать папку с DICOM (рекомендуется)"
             >
               Исследования
             </button>
@@ -408,6 +619,14 @@ function App() {
           } as Record<string, string>)}
         />
         <input
+          ref={filesOnlyInputRef}
+          className="upload-input"
+          type="file"
+          multiple
+          accept=".dcm,.dicom,application/dicom"
+          onChange={handleFileChange}
+        />
+        <input
           ref={comparisonFolderRef}
           className="upload-input"
           type="file"
@@ -430,25 +649,39 @@ function App() {
                 кликабельные crosshair, предсказуемая синхронизация и настоящая
                 рабочая раскладка.
               </p>
+              <p className="upload-note">
+                Нужна распакованная папка с файлами .dcm (не ZIP). В Chrome/Edge выберите именно папку с
+                срезами. Очень большие исследования разбираются порциями; при падении вкладки закройте лишние
+                программы и повторите.
+              </p>
             </div>
 
             <div className="upload-actions">
-              <label className="upload-box">
-                <input
-                  className="upload-input"
-                  type="file"
-                  multiple
-                  onChange={handleFileChange}
-                  {...({
-                    webkitdirectory: '',
-                    directory: '',
-                  } as Record<string, string>)}
-                />
-                <span className="upload-button">Выбрать папку исследования</span>
-                <span className="upload-hint">
-                  Подходит для папки КТ, где лежат все срезы и служебные файлы
-                </span>
-              </label>
+              <div className="upload-import-block">
+                <label className="upload-box">
+                  <input
+                    className="upload-input"
+                    type="file"
+                    multiple
+                    onChange={handleFileChange}
+                    {...({
+                      webkitdirectory: '',
+                      directory: '',
+                    } as Record<string, string>)}
+                  />
+                  <span className="upload-button">Выбрать папку исследования</span>
+                  <span className="upload-hint">
+                    Подходит для папки КТ, где лежат все срезы и служебные файлы
+                  </span>
+                </label>
+                <button
+                  type="button"
+                  className="upload-button upload-button-secondary"
+                  onClick={() => filesOnlyInputRef.current?.click()}
+                >
+                  Или несколько файлов .dcm
+                </button>
+              </div>
 
               <div className={`scan-status scan-status-${scanStatus}`}>
                 <span className="summary-label">Статус проверки</span>
@@ -484,7 +717,7 @@ function App() {
                 <h3>Серии исследования</h3>
                 {!isStudyRailCollapsed ? (
                   seriesList.length > 0 ? (
-                    <span>Нажмите на карточку, чтобы открыть серию</span>
+                    <span>Карточка — открыть серию; меню ⋮ — убрать из списка (файлы на диске не удаляются)</span>
                   ) : (
                     <span>Серии пока не распознаны</span>
                   )
@@ -525,30 +758,79 @@ function App() {
                 <div className="series-list" role="list">
                   {filteredSeriesList.map((series) => {
                     const isActive = series.seriesInstanceUid === activeSeriesUid
+                    const menuOpen = seriesRowMenuUid === series.seriesInstanceUid
                     return (
-                      <button
-                        className={isActive ? 'series-row active' : 'series-row'}
+                      <div
+                        className={isActive ? 'series-row-card active' : 'series-row-card'}
                         key={`${series.studyInstanceUid}-${series.seriesInstanceUid}`}
-                        onClick={() => setActiveSeriesUid(series.seriesInstanceUid)}
-                        type="button"
                         role="listitem"
-                        title={`${series.seriesDescription || 'Серия'} · ${series.modality} · ${series.files.length} срез.`}
                       >
-                        <div className="series-row-main">
-                          <div className="series-row-title">
-                            <span className="series-row-desc">{series.seriesDescription || 'Серия без описания'}</span>
-                            <span className="series-row-meta">
-                              {series.modality} · {series.files.length}
-                            </span>
+                        <button
+                          className="series-row-body"
+                          onClick={() => setActiveSeriesUid(series.seriesInstanceUid)}
+                          type="button"
+                          title={`${series.seriesDescription || 'Серия'} · ${series.modality} · ${series.files.length} срез.`}
+                        >
+                          <div className="series-row-main">
+                            <div className="series-row-title-block">
+                              <span className="series-row-desc">
+                                {series.seriesDescription || 'Серия без описания'}
+                              </span>
+                              <span className="series-row-meta">
+                                {series.modality} · {series.files.length}
+                              </span>
+                            </div>
+                            <div className="series-row-sub">
+                              <span className="series-row-patient">
+                                {(series.patientName || '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim()}
+                              </span>
+                              <span className="series-row-date">{formatDate(series.studyDate)}</span>
+                            </div>
                           </div>
-                          <div className="series-row-sub">
-                            <span className="series-row-patient">
-                              {(series.patientName || '').replace(/\^/g, ' ').replace(/\s+/g, ' ').trim()}
-                            </span>
-                            <span className="series-row-date">{formatDate(series.studyDate)}</span>
-                          </div>
+                        </button>
+                        <div className="series-row-menu-root" data-series-menu-root="">
+                          <button
+                            type="button"
+                            className="series-row-menu-trigger"
+                            title="Действия со серией"
+                            aria-label={`Меню: ${series.seriesDescription || 'серия'}`}
+                            aria-haspopup="menu"
+                            aria-expanded={menuOpen}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setSeriesRowMenuUid((u) =>
+                                u === series.seriesInstanceUid ? null : series.seriesInstanceUid,
+                              )
+                            }}
+                          >
+                            <svg
+                              className="series-row-menu-icon"
+                              width="16"
+                              height="16"
+                              viewBox="0 0 16 16"
+                              aria-hidden={true}
+                            >
+                              <circle cx="8" cy="3" r="1.65" fill="currentColor" />
+                              <circle cx="8" cy="8" r="1.65" fill="currentColor" />
+                              <circle cx="8" cy="13" r="1.65" fill="currentColor" />
+                            </svg>
+                          </button>
+                          {menuOpen ? (
+                            <div className="series-row-dropdown" role="menu">
+                              <button
+                                type="button"
+                                className="series-row-dropdown-item danger"
+                                role="menuitem"
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={() => removeStudySeries(series.seriesInstanceUid)}
+                              >
+                                Удалить из списка
+                              </button>
+                            </div>
+                          ) : null}
                         </div>
-                      </button>
+                      </div>
                     )
                   })}
                   {filteredSeriesList.length === 0 ? (
@@ -639,7 +921,6 @@ function App() {
                 }
                 onReportViewerFocus={setSimilarCasesFocus}
                 comparisonWorkbenchProbe={comparisonWorkbenchProbe}
-                suspendGlobalShortcuts={showPatientMismatchModal}
               />
               {comparisonPaneOpen && comparisonSeries ? (
                 <DicomViewport
@@ -648,25 +929,12 @@ function App() {
                   comparisonSync={comparisonSync ?? null}
                   comparisonSessionKey={comparisonSessionKey}
                   viewerLabel="Серия сравнения"
-                  suspendGlobalShortcuts={showPatientMismatchModal}
                 />
               ) : null}
             </div>
           </div>
         </div>
       </section>
-
-      {activeSeries && comparisonSeries ? (
-        <ComparisonPatientMismatchModal
-          open={showPatientMismatchModal}
-          primaryPatientId={activeSeries.patientId ?? ''}
-          secondaryPatientId={comparisonSeries.patientId ?? ''}
-          onContinue={() => {
-            if (comparisonSessionKey) setPatientMismatchAcknowledgedKey(comparisonSessionKey)
-          }}
-          onHideComparison={() => setComparisonPaneOpen(false)}
-        />
-      ) : null}
 
       {activeSeries ? (
         <SimilarCasesModal

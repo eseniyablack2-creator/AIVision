@@ -3,6 +3,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import type { DicomSeries } from '../lib/dicom'
+import { getSegmentationApiBase } from '../lib/inferenceApiBase'
 import { ViewCubeSvg, type ViewCubeFace } from './ViewCubeSvg'
 
 export type True3DPresetId = 'aorta' | 'vessels_clean' | 'vessels_contrast' | 'bones' | 'lungs_air'
@@ -47,9 +48,7 @@ const MAX_PREVIEW_SLICES = 420
 const REQUEST_TIMEOUT_MS = 120_000
 
 function getApiBase(): string {
-  const raw = import.meta.env.VITE_PATHOLOGY_API_URL
-  if (typeof raw === 'string' && raw.trim().length > 0) return raw.trim().replace(/\/$/, '')
-  return 'http://127.0.0.1:8000'
+  return getSegmentationApiBase()
 }
 
 function pickPreviewStride(total: number): number {

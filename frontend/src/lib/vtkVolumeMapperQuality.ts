@@ -18,8 +18,8 @@ export function configureVolumeMapperSampling(
   const s = minVoxelSpacingMM
   if (tier === 'high') {
     mapper.setAutoAdjustSampleDistances(false)
-    mapper.setSampleDistance(Math.max(s * 0.15, 0.06))
-    mapper.setMaximumSamplesPerRay(4000)
+    mapper.setSampleDistance(Math.max(s * 0.11, 0.045))
+    mapper.setMaximumSamplesPerRay(5500)
   } else {
     mapper.setAutoAdjustSampleDistances(true)
     mapper.setSampleDistance(Math.max(s * 0.35, 0.2))

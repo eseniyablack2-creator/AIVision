@@ -58,7 +58,7 @@ export const VOLUME_3D_PRESETS: readonly Volume3dPreset[] = [
     description: 'Сосудистый режим с агрессивным подавлением кости и сохранением кальция у стенки.',
     settings: {
       blendMode: 'composite',
-      colormapStyle: 'vascular-isolated',
+      colormapStyle: 'vascular-aorta',
       suppressBone: true,
       hardBoneCut: true,
       vesselOnly: true,

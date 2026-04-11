@@ -1,15 +1,16 @@
 /**
  * Точка подключения серверного инференса вместо чистых эвристик.
  *
- * Задайте в `.env`: VITE_PATHOLOGY_API_URL=https://your-inference-host
- * Реализация POST (объём, серия, маски) — на стороне бэкенда; клиент пока только сообщает, настроен ли URL.
+ * Задайте в `frontend/.env`: VITE_PATHOLOGY_API_URL=http://127.0.0.1:8787
+ * Без .env используется {@link getInferenceApiBase} (порт 8787, см. inference/README.md).
  */
+import { getExplicitPathologyApiBaseFromEnv, getInferenceApiBase } from './inferenceApiBase'
+
 export function isPathologyRemoteApiConfigured(): boolean {
-  const raw = import.meta.env.VITE_PATHOLOGY_API_URL
-  return typeof raw === 'string' && raw.trim().length > 0
+  return getExplicitPathologyApiBaseFromEnv() != null
 }
 
-export function getPathologyRemoteApiBase(): string | null {
-  if (!isPathologyRemoteApiConfigured()) return null
-  return String(import.meta.env.VITE_PATHOLOGY_API_URL).trim().replace(/\/$/, '')
+/** База для POST /v1/ct-screen и т.п.; без .env — localhost:8787. */
+export function getPathologyRemoteApiBase(): string {
+  return getInferenceApiBase()
 }

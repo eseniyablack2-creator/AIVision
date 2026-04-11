@@ -4,8 +4,13 @@
   "description": "Корневые команды проксируют в frontend/ (см. README).",
   "scripts": {
     "dev": "npm run dev --prefix frontend",
+    "dev:full": "concurrently -n web,api -c cyan,magenta \"npm run dev --prefix frontend\" \"node scripts/run-inference.mjs\"",
+    "inference": "node scripts/run-inference.mjs",
     "build": "npm run build --prefix frontend",
     "lint": "npm run lint --prefix frontend",
     "preview": "npm run preview --prefix frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
   }
 }

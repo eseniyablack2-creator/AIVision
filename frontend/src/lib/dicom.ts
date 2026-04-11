@@ -214,13 +214,26 @@ export async function buildSeries(files: File[]) {
     .sort((a, b) => b.files.length - a.files.length)
 }
 
+const DICOM_PARSE_BATCH = 24
+
 /**
  * Более надёжный разбор папки: не делаем двойное чтение файла (isDicomFile -> parseDicomFile),
  * а сразу пытаемся распарсить метаданные. Это заметно увеличивает долю «подхваченных» срезов
  * на больших исследованиях и ускоряет импорт.
+ *
+ * Пакетами: параллельный `Promise.all` по всем файлам съедает память на тысячах срезов и рвёт вкладку.
  */
-export async function buildSeriesWithRejects(files: File[]) {
-  const parsed = await Promise.all(files.map((file) => parseDicomFile(file)))
+export async function buildSeriesWithRejects(
+  files: File[],
+  options?: { onProgress?: (done: number, total: number) => void },
+) {
+  const parsed: (ParsedDicomFile | null)[] = []
+  for (let i = 0; i < files.length; i += DICOM_PARSE_BATCH) {
+    const chunk = files.slice(i, i + DICOM_PARSE_BATCH)
+    const part = await Promise.all(chunk.map((file) => parseDicomFile(file)))
+    parsed.push(...part)
+    options?.onProgress?.(Math.min(i + chunk.length, files.length), files.length)
+  }
   const accepted: ParsedDicomFile[] = []
   const rejected: File[] = []
   for (let i = 0; i < files.length; i += 1) {

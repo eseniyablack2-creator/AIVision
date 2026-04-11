@@ -4,6 +4,7 @@ AIVision inference HTTP API.
 Запуск: из каталога inference/
   pip install -r requirements.txt
   uvicorn app.main:app --reload --host 0.0.0.0 --port 8787
+  (--host 0.0.0.0 чтобы запросы с localhost:порт в браузере стабильно доходили до API)
 
 Опционально TotalSegmentator:
   pip install -r requirements-totalsegmentator.txt

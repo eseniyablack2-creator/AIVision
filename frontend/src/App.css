@@ -205,11 +205,23 @@
   line-height: 1.7;
 }
 
+.upload-note {
+  margin-top: 12px !important;
+  font-size: 0.92rem;
+  color: #3d5a4d !important;
+}
+
 .upload-actions {
   margin-top: 22px;
   display: grid;
   grid-template-columns: 1.2fr 0.8fr;
   gap: 16px;
+}
+
+.upload-import-block {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
 .upload-box {
@@ -237,6 +249,15 @@
   background: #18473b;
   color: #f5f7f6;
   font-weight: 700;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+}
+
+.upload-button-secondary {
+  align-self: flex-start;
+  background: #2d5c4e;
+  font-weight: 600;
 }
 
 .upload-hint {
@@ -489,23 +510,111 @@
   gap: 6px;
 }
 
-.series-row {
-  width: 100%;
-  text-align: left;
-  cursor: pointer;
+.series-row-card {
+  position: relative;
+  min-width: 0;
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(21, 28, 36, 0.55);
   color: #eef4f5;
-  padding: 10px 10px;
+}
+
+.series-row-body {
+  width: 100%;
+  display: block;
+  text-align: left;
+  cursor: pointer;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  padding: 10px 38px 10px 10px;
   min-width: 0;
 }
 
-.series-row:hover {
+.series-row-menu-root {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+}
+
+.series-row-menu-trigger {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(21, 28, 36, 0.92);
+  color: rgba(220, 228, 235, 0.82);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.series-row-menu-trigger:hover {
+  border-color: rgba(242, 212, 92, 0.35);
+  color: #f2d45c;
+}
+
+.series-row-menu-trigger[aria-expanded='true'] {
+  border-color: rgba(242, 212, 92, 0.5);
+  color: #f2d45c;
+}
+
+.series-row-menu-trigger:focus-visible {
+  outline: 2px solid #f2d45c;
+  outline-offset: 2px;
+}
+
+.series-row-menu-icon {
+  display: block;
+}
+
+.series-row-dropdown {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 40;
+  min-width: 196px;
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #1a222c;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+}
+
+.series-row-dropdown-item {
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  color: #eef4f5;
+  background: transparent;
+}
+
+.series-row-dropdown-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.series-row-dropdown-item.danger {
+  color: #ffb4a8;
+}
+
+.series-row-dropdown-item.danger:hover {
+  background: rgba(180, 60, 50, 0.22);
+}
+
+.series-row-card:hover {
   border-color: rgba(242, 212, 92, 0.28);
 }
 
-.series-row.active {
+.series-row-card.active {
   border-color: #f2d45c;
   box-shadow: 0 0 0 1px rgba(242, 212, 92, 0.35);
 }
@@ -516,27 +625,33 @@
   min-width: 0;
 }
 
-.series-row-title {
+.series-row-title-block {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
   min-width: 0;
 }
 
 .series-row-desc {
   font-size: 0.86rem;
   font-weight: 750;
+  line-height: 1.28;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .series-row-meta {
   flex: 0 0 auto;
-  font-size: 0.78rem;
+  font-size: 0.76rem;
   font-weight: 700;
   color: rgba(220, 228, 235, 0.72);
+  letter-spacing: 0.02em;
 }
 
 .series-row-sub {
@@ -1199,6 +1314,72 @@
 
 .workstation-card.volume-mode .viewer-stage-shell {
   margin-top: 4px;
+}
+
+.volume-viewport-stack {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * Важно: если единственные дети стека — absolute, flex не получает высоту по контенту → 0px и «пустой» 3D.
+ * Хост оставляем во flow (flex:1), внутри .true3d-shell по-прежнему absolute inset 0.
+ */
+.volume-viewport-stack.volume-viewport-shell > .volume-vtk-host {
+  position: relative;
+  inset: auto;
+  flex: 1;
+  align-self: stretch;
+  width: 100%;
+  min-height: 0;
+  height: auto;
+}
+
+/* 3D: оболочка может быть внутри .volume-vtk-host (абсолютное заполнение стека). */
+.volume-vtk-host > .true3d-shell {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+  height: auto;
+}
+
+.volume-viewport-stack > .true3d-shell {
+  flex: 1;
+  min-height: 0;
+}
+
+.volume-lasso-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  touch-action: none;
+}
+
+.volume-lasso-overlay--interactive {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+.volume-lasso-busy {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: all;
+  background: rgba(2, 6, 14, 0.45);
+  color: #f5d96c;
+  font-weight: 700;
+  font-size: 15px;
+  text-align: center;
+  padding: 16px;
 }
 
 .viewer-stage {
@@ -1986,6 +2167,55 @@
   gap: 8px;
 }
 
+.inspector-control-slider-num {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 100%;
+}
+
+.inspector-range-grow {
+  flex: 1;
+  min-width: 64px;
+  max-width: min(200px, 100%);
+}
+
+.inspector-num-input {
+  width: 54px;
+  flex-shrink: 0;
+  padding: 4px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(8, 12, 18, 0.85);
+  color: rgba(230, 236, 242, 0.95);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.inspector-num-input:focus {
+  outline: none;
+  border-color: rgba(245, 217, 108, 0.45);
+  box-shadow: 0 0 0 1px rgba(245, 217, 108, 0.2);
+}
+
+.inspector-value-suffix {
+  flex-shrink: 0;
+  margin-left: -2px;
+}
+
+.inspector-param-hint {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  font-size: 0.62rem;
+  line-height: 1.35;
+  color: rgba(168, 180, 192, 0.58);
+  font-weight: 400;
+}
+
+.inspector-param-hint.inspector-bone-warn {
+  color: rgba(224, 168, 85, 0.92);
+}
+
 .inspector-value {
   font-variant-numeric: tabular-nums;
   color: rgba(200, 210, 220, 0.78);
@@ -2369,7 +2599,7 @@
   height: 100%;
   display: block;
   background: #050608;
-  /* Не форсируем crisp/pixelated — масштаб и сглаживание задаёт canvas (imageSmoothing*). */
+  /* Базово auto; при масштабировании кадра DicomViewport выставляет crisp-edges или auto + сглаживание в drawImage. */
   image-rendering: auto;
 }
 
@@ -2395,6 +2625,10 @@
 
 .viewer-surface.cursor-wl {
   cursor: cell;
+}
+
+.viewer-surface.cursor-crosshair {
+  cursor: crosshair;
 }
 
 .grid-section {

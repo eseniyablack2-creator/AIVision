@@ -3,6 +3,7 @@ export type CtVolumeBlendMode = 'composite' | 'mip' | 'average'
 export type CtColormapStyle =
   | 'vascular'
   | 'vascular-isolated'
+  | 'vascular-aorta'
   | 'density-heatmap'
   | 'bones'
   | 'bones-rich'
@@ -11,6 +12,7 @@ export type CtColormapStyle =
 export const CT_VOLUME_COLORMAP_IDS: readonly CtColormapStyle[] = [
   'vascular',
   'vascular-isolated',
+  'vascular-aorta',
   'density-heatmap',
   'bones',
   'bones-rich',

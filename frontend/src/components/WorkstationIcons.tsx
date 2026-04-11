@@ -222,6 +222,19 @@ export function IconHuRoiPoly({ className, title }: IconProps) {
   )
 }
 
+/** Лассо: обводка области (затемнение снаружи на срезе) */
+export function IconViewLasso({ className, title }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden>
+      {title ? <title>{title}</title> : null}
+      <path
+        {...common}
+        d="M6 8c2-3 5-4 8-2s4 5 3 8-4 6-8 5-5-4-4-8c0-2 1-3 1-3"
+      />
+    </svg>
+  )
+}
+
 /** Ruler — diagonal line with end caps */
 export function IconRuler({ className, title }: IconProps) {
   return (
